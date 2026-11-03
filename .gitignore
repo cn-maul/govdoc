@@ -1,0 +1,39 @@
+# ---- Go 构建产物 ----
+/govdoc
+/govdoc.exe
+*.exe
+*.test
+*.out
+/dist/
+
+# tools/ 下各命令直接 go build 时会产生同名可执行文件
+/httpe2e
+/httpe2e.exe
+/stublm
+/stublm.exe
+/e2e
+/e2e.exe
+
+# ---- 前端 ----
+web/node_modules/
+web/.vite/
+web/*.tsbuildinfo
+
+# web/dist 是被 go:embed 依赖的构建产物：它必须存在于源码树中才能编译，
+# 因此**不忽略**。修改前端后请执行 `cd web && pnpm run build` 并提交结果，
+# 否则二进制里会是旧界面。
+
+# ---- 编辑器与系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# ---- 本地配置（可能含 API Key，绝不入库）----
+.env
+.env.local
+*.local.json
+
+# ---- e2e 输出 ----
+/out/

@@ -1,0 +1,873 @@
+/**
+ * GovDoc HTTP 线格式类型。
+ *
+ * 本文件是 internal/api/types.go 与 internal/docmodel/{model,verify}.go 的
+ * TypeScript 镜像，字段名与 json tag 一一对应。后端改字段名 = 破坏性变更，
+ * 这里必须同步改。
+ *
+ * 约定：字段名用 snake_case，与 Go 的 json tag 完全一致，不做驼峰转换，
+ * 这样浏览器里看到的对象和服务端 JSON 逐字段可比对。
+ */
+
+// ---------------------------------------------------------------- docmodel
+
+/** NodeKind 是原文可寻址块的分类。 */
+export type NodeKind =
+  | 'paragraph'
+  | 'heading'
+  | 'list_item'
+  | 'table'
+  | 'image'
+  | 'page_break'
+
+/** Severity 是校验诊断的严重级别。 */
+export type Severity = 'error' | 'warning' | 'info'
+
+/** Role 是公文元素，决定套用哪一条 GB/T 9704-2012 样式。 */
+export type Role =
+  | 'copy_number'
+  | 'security'
+  | 'urgency'
+  | 'masthead'
+  | 'doc_number'
+  | 'signatory'
+  | 'red_line'
+  | 'title'
+  | 'recipient'
+  | 'body'
+  | 'heading1'
+  | 'heading2'
+  | 'heading3'
+  | 'heading4'
+  | 'attachment_note'
+  | 'signature'
+  | 'date'
+  | 'note'
+  | 'cc'
+  | 'printer'
+  | 'attachment'
+
+/** Direction 是行文方向。 */
+export type Direction = '下行文' | '上行文' | '平行文'
+
+/** FontSize 是汉字字号名。 */
+export type FontSize =
+  | '初号'
+  | '小初'
+  | '一号'
+  | '小一'
+  | '二号'
+  | '小二'
+  | '三号'
+  | '小三'
+  | '四号'
+  | '小四'
+  | '五号'
+  | '小五'
+
+/** Align 是水平对齐（both = 两端对齐）。 */
+export type Align = 'left' | 'center' | 'right' | 'both'
+
+/** LineRule 是行距规则（exact = 固定值）。 */
+export type LineRule = 'exact' | 'auto'
+
+/** Run 是一段共享行内样式的文本，来自原文。 */
+export interface Run {
+  text: string
+  bold?: boolean
+  italic?: boolean
+  source_font?: string
+}
+
+/** ImageRef 是随管线传递的图片引用（原始字节不经 JSON）。 */
+export interface ImageRef {
+  name: string
+  mime_type: string
+}
+
+/** Node 是原文中一个可寻址块。text 必须逐字不变。 */
+export interface Node {
+  id: string
+  kind: NodeKind
+  level?: number
+  /** VERBATIM 原文文本：任何阶段都不得改写。 */
+  text: string
+  runs?: Run[]
+  rows?: string[][]
+  header_row?: boolean
+  order: number
+  source_style?: string
+  source_page?: number
+}
+
+/** DocumentModel 是一次上传解析的结果。 */
+export interface DocumentModel {
+  source_name: string
+  format: string
+  nodes: Node[]
+}
+
+/** Section 是模型提出的章节树节点。它从不携带正文，只引用原文节点 id。 */
+export interface Section {
+  id: string
+  /** 章节标题文本。 */
+  title: string
+  /** 层次序数深度：1 → 「一、」，2 → 「（一）」，3 → 「1.」，4 → 「（1）」。 */
+  level: number
+  /** 指向原文标题节点；为空表示标题由模型生成。 */
+  heading_node_id?: string
+  /** 本节正文引用的原文节点 id，按输出顺序排列。 */
+  body_node_ids?: string[]
+  /** 为 false 表示模型有意调整了节内顺序。 */
+  preserve_order?: boolean
+  children?: Section[]
+  /** 模型的简短理由，供人工复核。 */
+  rationale?: string
+}
+
+/**
+ * EditKind 是一处已声明改动的分类（对应 docmodel.EditKind）。
+ *
+ * 核心不变式放宽为「原文可以被修改，但每一处修改都必须显式声明、可见、可审计」，
+ * 于是「改动」本身成了线上类型：模型必须逐条给出 before/after/reason，
+ * 校验器逐字比对时才认得出「已声明的修改」与「偷偷改写」的区别。
+ */
+export type EditKind =
+  | 'typo'
+  | 'grammar'
+  | 'wording'
+  | 'punctuation'
+  | 'sentence_split'
+  | 'heading'
+  | 'other'
+
+/**
+ * Edit 是一处已声明的改动（对应 docmodel.Edit）。
+ *
+ * before 必须与原文完全一致（校验要求它出现在该节点文本里），这条约束正是
+ * 「改动只能落在真实存在的文字上」的机械保证。
+ */
+export interface Edit {
+  /**
+   * 被修改的原文节点 id。**必填**：edit 是在某个节点内部替换文字，没有节点
+   * 就无处可改。空 node_id 会被服务端记为「未生效」并在原因里说明正确做法，
+   * 而不是被静默丢弃。
+   *
+   * 给原文补一个段落标题**不走这里**：那是结构问题，用「章节填 title 并留空
+   * heading_node_id」表达，生成的标题会计入 report.synthesized_headings 供复核。
+   */
+  node_id?: string
+  kind: EditKind
+  /** 必须与原文完全一致的待替换片段。 */
+  before: string
+  /** 替换后的文字。 */
+  after: string
+  /** 中文理由，改动日志里给人工复核看。 */
+  reason?: string
+  /** before 在节点内多次出现时，指定替换第几处（0 基，默认第一处）。 */
+  occurrence?: number
+}
+
+/** 改动类型的展示顺序与 docmodel.AllEditKinds() 一致。 */
+export const EDIT_KINDS: EditKind[] = [
+  'typo',
+  'grammar',
+  'wording',
+  'punctuation',
+  'sentence_split',
+  'heading',
+  'other',
+]
+
+/** 改动类型的中文标签，与 docmodel.EditLabel() 逐字一致。 */
+export const EDIT_KIND_LABEL: Record<EditKind, string> = {
+  typo: '错别字',
+  grammar: '语病/语句不通',
+  wording: '用词不严谨',
+  punctuation: '标点',
+  sentence_split: '断句',
+  heading: '新增标题',
+  other: '其他修改',
+}
+
+/** 未收录的 kind 也给出可读标签，避免界面上出现裸英文。 */
+export function editLabel(kind: string): string {
+  return EDIT_KIND_LABEL[kind as EditKind] ?? kind
+}
+
+/** Meta 是文种级元数据，全部可选。 */
+export interface Meta {
+  copy_number?: string
+  security?: string
+  urgency?: string
+  issuing_org?: string
+  doc_number?: string
+  signatory?: string
+  title?: string
+  recipient?: string
+  attachment_note?: string
+  signature?: string
+  date?: string
+  note?: string
+  cc?: string
+  printer?: string
+  print_date?: string
+}
+
+/** Plan 是模型给出的完整重构方案，也是用户在校对区编辑的对象。 */
+export interface Plan {
+  meta: Meta
+  /**
+   * 绑定到公文要素槽位的原文节点（对应 docmodel.Plan.Elements）。
+   *
+   * 真实上传的公文里「标题」「主送机关」「发文机关署名」「成文日期」「抄送」
+   * 本身就是普通段落。不把它们绑定到要素槽位，VerifyPlan 会把它们当成被丢弃的
+   * 正文，装配器也无处安放。编辑方案时必须原样保留该字段，否则会平白出现
+   * 「未被任何章节收录」的错误。
+   */
+  elements?: ElementBinding[]
+  /**
+   * 正文前言：主送机关之后、第一个「一、」之前的内容（对应
+   * docmodel.Plan.PreambleNodeIDs）。
+   *
+   * 几乎所有真实公文都以这样一段开头 ——「为深入贯彻落实……，现将有关事项
+   * 通知如下。」它属于正文，却不属于任何章节：若硬塞进章节，就会凭空印出一个
+   * 作者没写过的标题（如「一、通知引言」），还会占掉第一个真实标题应有的层次序数。
+   *
+   * 界面必须把它呈现为「正文前言（无编号）」，**不显示成章节、不编号**。
+   */
+  preamble_node_ids?: string[]
+  sections: Section[]
+  /**
+   * 已声明的改动（对应 docmodel.Plan.Edits）。
+   *
+   * 原设计完全不允许改动内容，那是最安全的规则，却让工具对用户真正拿来的文档
+   * 毫无用处 —— 带错别字、病句、或某章本就没有标题的稿子。规则因此放宽为：
+   * 原文可以被修改，但每一处修改都必须显式声明、可见、可审计。未声明的改动
+   * 仍然是错误（VerifyVerbatim 会抓到），所以没有任何东西能被偷偷改写。
+   */
+  edits?: Edit[]
+  notes?: string[]
+  model?: string
+}
+
+/** ElementBinding 把一个原文节点绑到一个公文要素槽位。 */
+export interface ElementBinding {
+  /** 槽位：title / recipient / date / cc / …；不得为 body。 */
+  role: Role
+  /** 填充该槽位的原文节点 id。 */
+  node_id: string
+}
+
+/** 可绑定为公文要素的槽位，与 docmodel.BindableRoles() 一致（不含 body）。 */
+export const BINDABLE_ROLES: Role[] = [
+  'copy_number',
+  'security',
+  'urgency',
+  'masthead',
+  'doc_number',
+  'signatory',
+  'title',
+  'recipient',
+  'attachment_note',
+  'signature',
+  'date',
+  'note',
+  'cc',
+  'printer',
+]
+
+/** Diagnostic 是一条校验发现。code 稳定，UI 不应去匹配中文。 */
+export interface Diagnostic {
+  code: string
+  severity: Severity
+  message: string
+  node_ids?: string[]
+}
+
+/** Report 是 VerifyPlan 的结论。 */
+export interface Report {
+  diagnostics: Diagnostic[]
+  /** 原文中携带正文的节点总数。 */
+  content_nodes: number
+  /** 方案覆盖到的节点数。 */
+  covered_nodes: number
+  /** 被重复收录的节点数。 */
+  duplicated_nodes: number
+  /** 指向不存在节点的引用数。 */
+  unknown_refs: number
+  /** 节内顺序与原文不一致的章节数。 */
+  reordered_sections: number
+  /** 模型自造标题数。 */
+  synthesized_headings: number
+  /** 绑定到公文要素槽位的节点数（对应 docmodel.Report.BoundElements）。 */
+  bound_elements: number
+}
+
+/**
+ * AppliedEdit 记录一处已生效的改动（对应 docmodel.AppliedEdit）。
+ *
+ * 它不是失败，而是用户复核用的改动日志：只有真正落到成文里的改动才会出现。
+ */
+export interface AppliedEdit {
+  node_id: string
+  kind: string
+  /** 中文标签，由服务端 EditLabel() 生成。 */
+  label: string
+  before: string
+  after: string
+  reason?: string
+}
+
+/**
+ * UnappliedEdit 记录一处未能生效的改动（对应 docmodel.UnappliedEdit）。
+ *
+ * 成因是 before 在原文中找不到（模型记错了字）或目标节点不存在。它不构成
+ * 文档本身的失败（原文完好无损），但用户必须知道「模型想做而没做成」。
+ */
+export interface UnappliedEdit {
+  node_id?: string
+  kind: string
+  before: string
+  reason: string
+}
+
+/** VerbatimDiff 说明成文相对原文的偏差。 */
+export interface VerbatimDiff {
+  /** 输出中缺失的原文。 */
+  missing?: string[]
+  /** 输出中多出的文本（应全部是装配器生成的脚手架）。 */
+  extra?: string[]
+  /**
+   * 同一 node id 下文本被改写、且**没有**已声明改动覆盖的条目 —— 必须恒为空。
+   *
+   * 这就是「偷偷改写」的定义，也是 Clean() 判定的两项之一（另一项是 missing）。
+   */
+  altered?: string[]
+  /** 已生效的改动（审核用，不是失败）。 */
+  changed?: AppliedEdit[]
+  /** 未生效的改动（before 未找到）。 */
+  unapplied?: UnappliedEdit[]
+}
+
+/**
+ * VerbatimDiff.Clean()：无缺失、无未声明改写。**已声明的改动不算失败**。
+ */
+export function diffClean(d: VerbatimDiff | null | undefined): boolean {
+  return !!d && (d.missing?.length ?? 0) === 0 && (d.altered?.length ?? 0) === 0
+}
+
+// ---------------------------------------------------------------- gbstandard
+
+/** PageSetup 是公文用纸的版面几何（标准值）。 */
+export interface PageSetup {
+  width_mm: number
+  height_mm: number
+  margin_top_mm: number
+  margin_bottom_mm: number
+  margin_left_mm: number
+  margin_right_mm: number
+  lines_per_page: number
+  chars_per_line: number
+  header_mm: number
+  footer_mm: number
+}
+
+/** BorderRule 描述一条横线。 */
+export interface BorderRule {
+  color: string
+  size_eighth_pt: number
+  space_pt: number
+  css_width: string
+}
+
+/** ParaStyle 是一个公文元素的完整排版参数。 */
+export interface ParaStyle {
+  role: Role
+  name: string
+  font: string
+  latin_font: string
+  size: FontSize
+  bold: boolean
+  color: string
+  align: Align
+  line_rule: LineRule
+  line_spacing_pt: number
+  space_before_lines: number
+  space_after_lines: number
+  first_line_indent_chars: number
+  left_indent_chars: number
+  right_indent_chars: number
+  hanging_indent_chars: number
+  keep_with_next: boolean
+  page_break_before?: boolean
+  border_bottom?: BorderRule
+  border_top?: BorderRule
+  outline_level?: number
+  standard?: string
+}
+
+/** Spec 是完整的格式标准：版面 + 每个 role 一条样式。 */
+export interface Spec {
+  page: PageSetup
+  direction: Direction
+  styles: Record<Role, ParaStyle>
+  page_number_size: FontSize
+  page_number_font: string
+  page_number_dash: string
+}
+
+// ---------------------------------------------------------------- profile
+
+/**
+ * Profile 是一套命名的排版规则（对应 api.Profile）。
+ *
+ * 软件因此是通用的：公文只是其中一套内置规则，用户还可以自建论文、报告等。
+ * 换一套 profile 就换掉标题/正文/行间距/字体/字号/页边距 —— 渲染管线不变，
+ * 变的只是这张规则表。
+ */
+export interface Profile {
+  id: string
+  name: string
+  description?: string
+  /**
+   * 是否内置。内置规则**不可直接改、不可删**，只能「复制一份」再改：
+   * 它是所有文档的兜底规则，也是恢复到标准样式的唯一依据。
+   *
+   * Go 侧是 `omitempty`，所以内置=false 时该字段**根本不存在**，
+   * 因此判读必须用真值判断而不是 `=== false`。
+   */
+  built_in?: boolean
+  spec: Spec
+}
+
+/** ProfilesResponse 是配置列表与当前默认。 */
+export interface ProfilesResponse {
+  profiles: Profile[]
+  active: string
+}
+
+/** ProfileRequest 新建或更新一套规则。 */
+export interface ProfileRequest {
+  /** 更新时必填；新建时必须为空（新建由服务端分配 id）。 */
+  id?: string
+  name: string
+  description?: string
+  spec: Spec
+  /** 从已有配置复制规则；此时 spec 传空对象。 */
+  copy_from?: string
+  /** 同时设为新上传文档的默认。 */
+  activate?: boolean
+}
+
+/**
+ * 中文标准字号的磅值，与 internal/gbstandard 的 fontPoints 逐项一致。
+ *
+ * 界面用它把「三号」翻译成「16pt」给人看。用户是按字号名思考的，不是按磅值，
+ * 所以下拉里给名字、旁边给磅值，两者都要有。
+ */
+export const FONT_SIZE_POINTS: Record<FontSize, number> = {
+  初号: 42,
+  小初: 36,
+  一号: 26,
+  小一: 24,
+  二号: 22,
+  小二: 18,
+  三号: 16,
+  小三: 15,
+  四号: 14,
+  小四: 12,
+  五号: 10.5,
+  小五: 9,
+}
+
+/** 字号下拉的顺序：从大到小，与 Word 的中文排版习惯一致。 */
+export const FONT_SIZE_ORDER: FontSize[] = [
+  '初号',
+  '小初',
+  '一号',
+  '小一',
+  '二号',
+  '小二',
+  '三号',
+  '小三',
+  '四号',
+  '小四',
+  '五号',
+  '小五',
+]
+
+/** 是否是标准字号。服务端也校验这一条，但本地先拦一道能少一次往返。 */
+export function isKnownFontSize(v: string): v is FontSize {
+  return Object.prototype.hasOwnProperty.call(FONT_SIZE_POINTS, v)
+}
+
+/**
+ * 字体候选。
+ *
+ * 前六项是公文用字，也是各内置配置的来源；后面几项是通用中文排版常备字体，
+ * 让用户建「论文/报告」这类配置时不必自己猜名字。
+ */
+export const FONT_CHOICES: string[] = [
+  '仿宋_GB2312',
+  '黑体',
+  '楷体_GB2312',
+  '方正小标宋简体',
+  '宋体',
+  'Times New Roman',
+  '仿宋',
+  '楷体',
+  'Microsoft YaHei',
+  '微软雅黑',
+  'SimSun',
+  'SimHei',
+  'KaiTi',
+  'STSong',
+  'Arial',
+]
+
+/**
+ * 规则编辑器里的 role 顺序。
+ *
+ * 它按「读者看到这份文件的顺序」排，而不是按 role 常量排：先是页面级元素，
+ * 再是标题与各级小标题，然后正文，最后是尾部要素。用户照这个顺序改，
+ * 脑子里就是文档的样子。
+ */
+export const EDITOR_ROLE_ORDER: Role[] = [
+  'copy_number',
+  'security',
+  'urgency',
+  'masthead',
+  'doc_number',
+  'signatory',
+  'red_line',
+  'title',
+  'recipient',
+  'body',
+  'heading1',
+  'heading2',
+  'heading3',
+  'heading4',
+  'attachment_note',
+  'signature',
+  'date',
+  'note',
+  'cc',
+  'printer',
+  'attachment',
+]
+
+/**
+ * 规则编辑器默认展开的 role。
+ *
+ * 只展开标题、正文和前三级标题：它们是用户调版式时真正会动的部分，也是
+ * 「换个配置，看起来不一样」的来源。其余 role 折叠起来，避免一张表单
+ * 二十多行把页面撑得没法用。
+ */
+export const EDITOR_ROLE_PRIMARY: Role[] = [
+  'title',
+  'body',
+  'heading1',
+  'heading2',
+  'heading3',
+]
+
+// ---------------------------------------------------------------- api
+
+/** ErrorDetail 是一次失败的机器可读描述。 */
+export interface ErrorDetail {
+  code: string
+  message: string
+  details?: string[]
+}
+
+/** ErrorBody 是所有失败响应的统一外形。 */
+export interface ErrorBody {
+  error: ErrorDetail
+}
+
+/** 稳定的错误码。 */
+export const ErrorCode = {
+  badRequest: 'bad_request',
+  notFound: 'not_found',
+  badKey: 'bad_key',
+  upstream: 'upstream_error',
+  noLLMConfig: 'llm_not_configured',
+  invalidPlan: 'invalid_plan',
+  parseFailed: 'parse_failed',
+  renderFailed: 'render_failed',
+  internal: 'internal_error',
+} as const
+
+export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode]
+
+/** Health 是存活探针。 */
+export interface Health {
+  status: string
+  version: string
+  llm_configured: boolean
+}
+
+/** LLMConfig 是模型连接配置。api_key 只写不回显。 */
+export interface LLMConfig {
+  endpoint: string
+  model: string
+  protocol: string
+  api_key_set: boolean
+  /** 仅写入时提交；读取时后端不会回传。 */
+  api_key?: string
+}
+
+/** ConfigResponse 是完整应用配置。 */
+export interface ConfigResponse {
+  llm: LLMConfig
+  direction: Direction
+  spec: Spec
+  /** 是否允许模型修正错别字/语病/用词（服务端保存的偏好）。 */
+  allow_edits: boolean
+  /** 新上传文档默认使用哪套排版规则。 */
+  active_profile?: string
+  /** 全部可用规则，设置页无需第二次请求即可渲染列表。 */
+  profiles?: Profile[]
+  /**
+   * 是否支持把设置写入磁盘。为 false 时界面**不得**承诺「重启后仍然有效」。
+   */
+  persistent: boolean
+  /** 设置文件路径，让「重启后仍有效」变成用户可核实的事实。 */
+  settings_path?: string
+  /** 上一次保存是否真的落盘。 */
+  saved_to_disk: boolean
+  /** 落盘失败时的中文说明；此时设置本次运行仍生效，属警告而非错误。 */
+  save_warning?: string
+}
+
+/** ConfigRequest 更新配置；省略的字段保持不变。 */
+export interface ConfigRequest {
+  endpoint?: string
+  model?: string
+  protocol?: string
+  /** 只在用户真的输入了新密钥时提交。 */
+  api_key?: string
+  direction?: Direction
+  /** 是否允许模型修正正文内容。 */
+  allow_edits?: boolean
+}
+
+/** FontStatus 报告某款公文字体在本机是否可用。 */
+export interface FontStatus {
+  name: string
+  available: boolean
+  fallbacks: string[]
+  used: string[]
+}
+
+/** SpecResponse 是当前格式标准 + 字体诊断。 */
+export interface SpecResponse {
+  spec: Spec
+  fonts: FontStatus[]
+  /** 非空说明 spec 不可信，UI 应拒绝导出。 */
+  problems?: string[]
+}
+
+/** NodeSummary 是上传响应与原文面板使用的轻量节点视图。 */
+export interface NodeSummary {
+  id: string
+  kind: NodeKind
+  level?: number
+  text: string
+  order: number
+  source_style?: string
+  source_page?: number
+  has_image?: boolean
+  table_cells?: number
+}
+
+/** UploadResponse 由 POST /api/documents 返回。 */
+export interface UploadResponse {
+  doc_id: string
+  source_name: string
+  format: string
+  node_count: number
+  content_count: number
+  /**
+   * 本文档**实际**生效的排版规则 id。
+   *
+   * 界面必须显示它，而不是用户在下拉框里选的那个：服务端对未知值会静默回退到
+   * 当前默认，若界面显示用户的选择，用户就会以为用了一套其实没用的规则。
+   */
+  profile_id?: string
+  nodes: NodeSummary[]
+}
+
+/** DocumentResponse 包装完整源文档。 */
+export interface DocumentResponse {
+  doc_id: string
+  doc: DocumentModel
+  /** 该文档记住的排版规则 id。 */
+  profile_id?: string
+}
+
+/** PlanRequest 请求开始分析。 */
+export interface PlanRequest {
+  hint?: string
+  direction?: Direction
+  /**
+   * 是否允许模型修正错别字/语病/用词。
+   *
+   * 省略表示沿用服务端保存的偏好；显式传布尔值则本次分析覆盖它。开启它并不
+   * 意味着可以「偷偷改写」：模型的每一处修正都必须作为一条 Edit 声明出来。
+   */
+  allow_edits?: boolean
+}
+
+/** PlanJobResponse 在分析启动时返回，随后客户端跟随 SSE 流。 */
+export interface PlanJobResponse {
+  job_id: string
+}
+
+/** StageEvent 是一帧 SSE 进度。 */
+export interface StageEvent {
+  name: string
+  message: string
+  done: boolean
+}
+
+/** PlanResponse 让方案与校验结论永远一起传输。 */
+export interface PlanResponse {
+  plan: Plan | null
+  report: Report | null
+  job_id?: string
+}
+
+/** DoneEvent 是终止 SSE 帧。 */
+export interface DoneEvent {
+  plan: Plan | null
+  report: Report | null
+  error?: string
+}
+
+/** RenderRequest 请求成文输出。 */
+export interface RenderRequest {
+  format: 'docx'
+  /** 用户最新编辑的方案；省略时服务端使用已存方案。 */
+  plan?: Plan
+}
+
+/** RenderResponse 报告成文结果。 */
+export interface RenderResponse {
+  file_id: string
+  filename: string
+  size: number
+  report: Report | null
+  diff: VerbatimDiff | null
+  /** 装配器生成的脚手架文本（层次序数、版头），列出以便复核。 */
+  synth_text?: string[]
+}
+
+// ---------------------------------------------------------------- UI helpers
+
+/** kind 的中文名，用于原文节点列表。 */
+export const KIND_LABEL: Record<NodeKind, string> = {
+  paragraph: '段落',
+  heading: '标题',
+  list_item: '列表项',
+  table: '表格',
+  image: '图片',
+  page_break: '分页符',
+}
+
+/** 只渲染一句就够的节点类型不需要展开正文。 */
+export function kindCarriesProse(kind: NodeKind): boolean {
+  return kind !== 'page_break'
+}
+
+/** role 的中文名，标题样式表里也可能缺，故是可选的。 */
+export const ROLE_LABEL: Partial<Record<Role, string>> = {
+  copy_number: '份号',
+  security: '密级',
+  urgency: '紧急程度',
+  masthead: '发文机关标志',
+  doc_number: '发文字号',
+  signatory: '签发人',
+  red_line: '红色分隔线',
+  title: '标题',
+  recipient: '主送机关',
+  body: '正文',
+  heading1: '一级标题',
+  heading2: '二级标题',
+  heading3: '三级标题',
+  heading4: '四级标题',
+  attachment_note: '附件说明',
+  signature: '发文机关署名',
+  date: '成文日期',
+  note: '附注',
+  cc: '抄送机关',
+  printer: '印发机关',
+  attachment: '附件',
+}
+
+/** severity 的中文名。 */
+export const SEVERITY_LABEL: Record<Severity, string> = {
+  error: '错误',
+  warning: '警告',
+  info: '提示',
+}
+
+/**
+ * 一套规则的一句话摘要，让用户不打开编辑器就能看出两套配置差在哪。
+ *
+ * 用户挑 profile 的方式就是「我要那种正文小一点、页边距宽一点的」，
+ * 所以摘要必须直接给正文那几项与页边距 —— 把二十多个 role 全列出来
+ * 既没有可比性也读不下去。
+ */
+export function specSummary(spec: Spec | undefined | null): string {
+  if (!spec) return '规则无法读取'
+  const body = spec.styles?.body
+  const title = spec.styles?.title
+  const p = spec.page
+  const bits: string[] = []
+  if (body) {
+    bits.push(`正文 ${body.font} ${body.size}`)
+    // 行距对「看起来不一样」影响很大，必须露出来。
+    if (body.line_spacing_pt > 0) bits.push(`行距 ${trimNum(body.line_spacing_pt)}pt`)
+    if (body.first_line_indent_chars > 0) {
+      bits.push(`首行缩进 ${trimNum(body.first_line_indent_chars)} 字`)
+    }
+  }
+  if (title) bits.push(`标题 ${title.size}`)
+  if (p) {
+    bits.push(`页边距 ${trimNum(p.margin_top_mm)}/${trimNum(p.margin_bottom_mm)}/${trimNum(p.margin_left_mm)}/${trimNum(p.margin_right_mm)}mm`)
+  }
+  return bits.length > 0 ? bits.join(' · ') : '无规则数据'
+}
+
+/** 去掉无意义的小数尾巴（28.990694… → 28.99）。 */
+export function trimNum(v: number): string {
+  if (!Number.isFinite(v)) return '—'
+  return String(Math.round(v * 100) / 100)
+}
+
+/** 由 profile id 找名称；找不到时回显 id 本身而不是空白。 */
+export function profileName(profiles: Profile[] | undefined, id: string | undefined): string {
+  if (!id) return ''
+  return profiles?.find((p) => p.id === id)?.name ?? id
+}
+
+/**
+ * Report.OK()：无 error 且每个正文节点恰好被收录一次才可成文。
+ *
+ * 对 `diagnostics` 做了空值防护：Go 的 nil slice 编码成 JSON `null`，而校验
+ * **通过**时它恰好为空 —— 不设防会在「用户终于修好」那一刻崩掉界面。
+ */
+export function reportOK(r: Report | null | undefined): boolean {
+  if (!r) return false
+  if (r.duplicated_nodes > 0 || r.unknown_refs > 0) return false
+  if (r.covered_nodes !== r.content_nodes) return false
+  return !(r.diagnostics ?? []).some((d) => d.severity === 'error')
+}
+
+/** Report 的中文一行摘要，与 Go 端 Summary() 等价。 */
+export function reportSummary(r: Report | null | undefined): string {
+  if (!r) return '尚未校验'
+  return `${reportOK(r) ? '校验通过' : '校验未通过'}：正文节点 ${r.covered_nodes}/${r.content_nodes} 已覆盖，重复 ${r.duplicated_nodes}，无效引用 ${r.unknown_refs}`
+}
