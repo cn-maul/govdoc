@@ -54,7 +54,7 @@ func TestAgentVisibleFieldsAreStable(t *testing.T) {
 		{"ModelListRequest", ModelListRequest{}, []string{"endpoint", "protocol", "api_key"}},
 		{"ModelListResponse", ModelListResponse{}, []string{"models"}},
 		{"ConfigResponse", ConfigResponse{},
-			[]string{"llm", "direction", "spec", "allow_edits", "active_profile",
+			[]string{"llm", "direction", "spec", "allow_edits", "rewrite", "active_profile",
 				"profiles", "persistent", "settings_path", "saved_to_disk", "save_warning"}},
 		{"UploadResponse", UploadResponse{},
 			[]string{"doc_id", "source_name", "format", "node_count", "content_count",

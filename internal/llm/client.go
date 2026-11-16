@@ -37,6 +37,8 @@ import (
 
 	"govdoc/internal/baseline"
 	"govdoc/internal/docmodel"
+	"govdoc/internal/gbstandard"
+	"govdoc/internal/style"
 )
 
 // ErrNotConfigured is returned when endpoint, key or model is missing.
@@ -357,6 +359,16 @@ type PlanOptions struct {
 	// show chapters and review items as they arrive instead of waiting for the
 	// entire JSON document.
 	Partial func(PartialPlan)
+	// Outline is the document type's structural rules, taken from the profile
+	// the document is rendered under. Nil means the 公文 default.
+	//
+	// It reaches the prompt instead of being hard-coded there, so adding a
+	// document type is a settings change rather than a code change.
+	Outline *gbstandard.Outline
+	// Limits is the rewrite budget from the user's settings. The same value is
+	// stored on the returned plan, so the export gate measures the result
+	// against exactly what the model was told.
+	Limits style.Limits
 }
 
 // PartialPlan is an incremental view of the model's answer.
@@ -413,7 +425,7 @@ func (c *Client) PlanWithOptions(
 	// exchange is what makes the repair round effective: a fresh prompt would
 	// often reproduce the same mistake.
 	messages := []rosetta.Message{
-		rosetta.User(buildUserPrompt(doc, opts.Hint, opts.AllowEdits)),
+		rosetta.User(buildUserPromptWith(doc, opts)),
 	}
 
 	var (
@@ -433,7 +445,7 @@ func (c *Client) PlanWithOptions(
 			notify(StageRepair, fmt.Sprintf("正在修正结构方案（第 %d 次）…", attempt))
 		}
 
-		resp, calls, err := c.chat(ctx, doc, opts.AllowEdits, messages, partial.chunk, partial.reset)
+		resp, calls, err := c.chat(ctx, doc, opts, messages, partial.chunk, partial.reset)
 		partial.flush()
 		rounds += calls
 		if err != nil {
@@ -515,6 +527,18 @@ func (c *Client) PlanWithOptions(
 			candidate.Edits = dropRecomposeConflicts(
 				candidate.Recompose, mergeEdits(doc, candidate.Edits))
 			candidate.Model = c.cfg.Model
+			// Stamp the budget the model was given. The export gate reads it
+			// from the plan, so a plan edited or re-rendered later is still
+			// measured against the same limits.
+			candidate.RewriteLimits = opts.Limits.Normalized()
+			// Same reason for the heading depth: the profile may allow fewer
+			// levels than the style table defines, and the verifier must judge
+			// this plan by that profile, not by the global maximum.
+			depth := gbstandard.DefaultOutline()
+			if opts.Outline != nil {
+				depth = opts.Outline.Normalized()
+			}
+			candidate.MaxHeadingDepth = depth.MaxDepth
 			msg := "分析完成"
 			if len(fixes) > 0 && !report.OK() {
 				msg = fmt.Sprintf("分析完成（本地修正了 %d 处结构问题）", len(fixes))
@@ -547,14 +571,14 @@ func (c *Client) PlanWithOptions(
 func (c *Client) chat(
 	ctx context.Context,
 	doc *docmodel.Document,
-	allowEdits bool,
+	opts PlanOptions,
 	messages []rosetta.Message,
 	onText func(string),
 	onReset func(),
 ) (*rosetta.ChatResponse, int, error) {
 	req := &rosetta.ChatRequest{
 		Model:           c.cfg.Model,
-		System:          systemPrompt(doc, allowEdits),
+		System:          systemPromptWith(doc, opts),
 		Messages:        messages,
 		MaxOutputTokens: c.maxOutput(doc),
 		Temperature:     c.temperature(),

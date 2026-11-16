@@ -25,6 +25,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { Disclosure, Tabs, ToggleButton, ToggleButtonGroup } from '@heroui/react'
 import {
+  diffClean,
   EDIT_KINDS,
   KIND_LABEL,
   ROLE_LABEL,
@@ -662,8 +663,11 @@ export default function PanelReview({ onPreview }: { onPreview: () => void }) {
   const diffHasProblems = useMemo(() => {
     const d = gov.render?.diff
     if (!d) return false
-    return (d.missing?.length ?? 0) > 0 || (d.altered?.length ?? 0) > 0
+    return !diffClean(d)
   }, [gov.render])
+
+  /** 每一段被整段重写的审计记录（改动幅度 / 允许上限 / 数据核对）。 */
+  const rewrites = useMemo(() => gov.render?.diff?.rewrites ?? [], [gov.render])
 
   // ---------------------------------------------------------------- 方案右栏
 
@@ -953,13 +957,16 @@ export default function PanelReview({ onPreview }: { onPreview: () => void }) {
    * 当成合规交付物拿走。
    */
   const downloadReady = useMemo(
-    () => gov.render !== null && reasons.length === 0,
+    () => gov.render !== null && reasons.length === 0 && diffClean(gov.render.diff),
     [gov.render, reasons],
   )
 
   /** 下载按钮不可用时的中文原因。 */
   const downloadWhy = useMemo(() => {
     if (gov.render === null) return '还没有生成公文文档，请先点「生成公文文档」。'
+    if (!diffClean(gov.render.diff)) {
+      return '成文没有通过逐字/改写比对，已暂停下载。请查看下方「改写幅度与数据核对」中的原因。'
+    }
     if (reasons.length > 0) return '当前方案未通过校验，已暂停下载。请先修好下方问题。'
     return ''
   }, [gov.render, reasons])
@@ -2205,6 +2212,76 @@ export default function PanelReview({ onPreview }: { onPreview: () => void }) {
                       {extraTexts.length === 0 && <div className={HINT}>没有额外文本。</div>}
                     </div>
                   </div>
+
+                  {/*
+                    整段重写是「允许大改」的入口，也是唯一能绕过逐字比对的通道。
+                    所以它必须单独列出：改了多少、这类文本允许改多少、有没有丢数字。
+                    用户看到的是具体的一段，而不是一个笼统的「校验失败」。
+                  */}
+                  {rewrites.length > 0 && (
+                    <div className="space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="text-xs font-medium">改写幅度与数据核对</div>
+                        <Badge
+                          color={
+                            rewrites.some(
+                              (r) => r.over_budget || (r.missing_facts ?? []).some((f) => f.hard),
+                            )
+                              ? 'danger'
+                              : 'success'
+                          }
+                        >
+                          {rewrites.length} 段已整段重写
+                        </Badge>
+                      </div>
+                      {rewrites.map((r) => {
+                        const hardLost = (r.missing_facts ?? []).filter((f) => f.hard)
+                        const softLost = (r.missing_facts ?? []).filter((f) => !f.hard)
+                        const invented = r.invented_facts ?? []
+                        const bad = r.over_budget || hardLost.length > 0 || invented.length > 0
+                        return (
+                          <div
+                            key={r.node_id}
+                            className={
+                              bad
+                                ? 'space-y-1.5 rounded-lg border border-danger/40 bg-danger-soft/40 p-2.5'
+                                : EDIT_BLOCK
+                            }
+                          >
+                            <Row>
+                              <Badge color={bad ? 'danger' : 'success'}>
+                                {r.tier_label}
+                              </Badge>
+                              <span className="font-mono text-xs text-muted">{r.node_id}</span>
+                              <span className={HINT}>
+                                改动 {r.change}% / 上限 {r.budget}%
+                              </span>
+                              {r.over_budget && <Badge color="danger">超出上限</Badge>}
+                            </Row>
+                            {hardLost.length > 0 && (
+                              <div className="text-xs text-danger">
+                                丢失原文数据：
+                                {hardLost.map((f) => f.text).join('、')}
+                              </div>
+                            )}
+                            {invented.length > 0 && (
+                              <div className="text-xs text-danger">
+                                出现原文没有的数据：
+                                {invented.map((f) => f.text).join('、')}
+                              </div>
+                            )}
+                            {softLost.length > 0 && (
+                              <div className={HINT}>
+                                建议核对：
+                                {softLost.map((f) => f.text).join('、')}
+                              </div>
+                            )}
+                            {r.reason && <div className={HINT}>模型说明：{r.reason}</div>}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
 
                   <Row>
                     <Badge color={appliedEdits.length > 0 ? 'success' : 'default'}>

@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"govdoc/internal/style"
 )
 
 // ---------------------------------------------------------------- source side
@@ -162,6 +164,17 @@ func (d *Document) Text(id string) string {
 }
 
 // ---------------------------------------------------------------- plan side
+
+// RewriteLimits is the change budget for a rewritten paragraph, keyed by the
+// register its source was read as.
+//
+// It is a docmodel type rather than a style one so the plan's JSON stays a
+// single self-describing object: a plan saved by one version can be re-checked
+// by the next without consulting the settings file.
+type RewriteLimits = style.Limits
+
+// DefaultRewriteLimits is the shipped budget.
+func DefaultRewriteLimits() RewriteLimits { return style.DefaultLimits() }
 
 // Section is one node of the chapter tree proposed by the LLM. It never
 // carries body prose: it names which source nodes belong to it.
@@ -359,6 +372,24 @@ type Plan struct {
 	// Section.BodyParts; a recomposed node may not also appear in
 	// BodyNodeIDs, PreambleNodeIDs or Elements.
 	Recompose []Recompose `json:"recompose,omitempty"`
+	// RewriteLimits is the change budget a recomposed paragraph may use,
+	// keyed by the register its source was read as.
+	//
+	// It travels on the plan because the verifier and the prompt builder must
+	// agree on one number: the model is told what it may change, and the export
+	// gate measures the result against the same table. The server fills it from
+	// the user's settings and never accepts it from the model's answer, so the
+	// model cannot raise its own limit.
+	RewriteLimits RewriteLimits `json:"rewrite_limits,omitempty"`
+	// MaxHeadingDepth is the deepest 层次序数 this document type allows.
+	//
+	// It travels on the plan for the same reason RewriteLimits does: the
+	// verifier must judge the plan against the profile that produced it. A
+	// 报告 may allow only two levels; without this the vetter would accept
+	// three and the extra level would render as body text.
+	//
+	// Zero means "not specified" and falls back to MaxHeadingDepth.
+	MaxHeadingDepth int `json:"max_heading_depth,omitempty"`
 	// Notes are model observations shown to the user (ambiguities,
 	// dropped boilerplate, low-confidence decisions).
 	Notes []string `json:"notes,omitempty"`
@@ -663,8 +694,14 @@ func AllRoles() []Role {
 	}
 }
 
-// HeadingRole maps a 层次序数 depth (1..4) to its role. Depth values outside
-// that range clamp to the deepest supported level.
+// MaxHeadingDepth is the deepest 层次序数 the style table can render
+// (heading1 .. heading4). A document type may use fewer levels, never more:
+// there is no fifth heading role to apply, so a deeper tree would be printed
+// with body style and lose its hierarchy.
+const MaxHeadingDepth = 4
+
+// HeadingRole maps a 层次序数 depth (1..MaxHeadingDepth) to its role. Depth
+// values outside that range clamp to the deepest supported level.
 func HeadingRole(level int) Role {
 	switch level {
 	case 1:

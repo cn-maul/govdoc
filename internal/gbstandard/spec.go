@@ -488,6 +488,11 @@ type Spec struct {
 	PageNumberFont string   `json:"page_number_font"`
 	// PageNumberDash is the 一字线 drawn on each side of the page number.
 	PageNumberDash string `json:"page_number_dash"`
+	// Outline is the structural rule set for this document type: which
+	// elements are expected, how chapters are numbered, and how many levels
+	// are allowed. It lives beside the styles so a document type is one
+	// object, not a style table plus a paragraph of hard-coded prompt.
+	Outline Outline `json:"outline,omitempty"`
 }
 
 // 标准 colours: 公文 版头 is red; the exact red of the 国标 sample is a
@@ -713,6 +718,7 @@ func Default() Spec {
 		PageNumberSize: SizeSihao, // 标准 §7.3.6: 4号半角宋体
 		PageNumberFont: FontSongti,
 		PageNumberDash: "—",
+		Outline:        DefaultOutline(),
 	}
 }
 
@@ -796,6 +802,10 @@ func ValidateSpec(s Spec) []string {
 	if !s.PageNumberSize.Known() {
 		problems = append(problems, fmt.Sprintf("页码字号 %q 未知", s.PageNumberSize))
 	}
+	// The outline decides which elements are expected and how chapters are
+	// numbered. A broken one produces a document that is typeset correctly but
+	// organised wrongly, so it belongs in the same validation pass.
+	problems = append(problems, ValidateOutline(s.Outline)...)
 	sort.Strings(problems)
 	return problems
 }

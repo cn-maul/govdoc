@@ -1354,3 +1354,44 @@ func TestPutPlanRecomputesStructure(t *testing.T) {
 		t.Error("把第二章的段落并入第一章应被识别为移动")
 	}
 }
+// TestRenderIgnoresClientSuppliedRewriteBudget: the rewrite budget is a
+// server-side policy, but the plan round-trips through the browser, so a
+// request can carry whatever limits it likes. The export gate must overwrite
+// them with the server's value — otherwise the check that stops a wholesale
+// rewrite can be switched off by editing one JSON field.
+func TestRenderIgnoresClientSuppliedRewriteBudget(t *testing.T) {
+	r := newRig(t, true)
+
+	// 公文 register: the formal budget is 15%, so replacing the whole sentence
+	// must be refused.
+	up := r.upload(t, "通知.txt", "为贯彻落实上级部署，现将有关事项通知如下。请各单位认真执行。")
+	replaced := "各地各部门要高度重视，确保各项政策落地见效。"
+
+	plan := map[string]any{
+		"recompose": []map[string]any{{
+			"node_id": "n0001",
+			"parts":   []string{replaced},
+			"reason":  "改写为公文语体",
+		}},
+		"sections": []map[string]any{{
+			"id": "s1", "title": "总体要求", "level": 1,
+			"body_parts": []map[string]any{{"node_id": "n0001", "part": 0}},
+		}},
+		// The client claims an unlimited budget. The server must ignore it.
+		"rewrite_limits": map[string]any{
+			"enabled": true, "formal_max": 100, "mixed_max": 100, "colloquial_max": 100,
+		},
+	}
+	payload, _ := json.Marshal(plan)
+	if resp, data := r.do(t, http.MethodPut, "/api/documents/"+up.DocID+"/plan",
+		json.RawMessage(payload)); resp.StatusCode != http.StatusOK {
+		t.Fatalf("提交方案失败: %d %s", resp.StatusCode, data)
+	}
+
+	resp, body := r.do(t, http.MethodPost, "/api/documents/"+up.DocID+"/render",
+		api.RenderRequest{Format: "docx"})
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("超预算改写被导出：客户端预算覆盖了服务端策略。\n%s", body)
+	}
+}
+

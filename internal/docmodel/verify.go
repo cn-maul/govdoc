@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"govdoc/internal/style"
 )
 
 // ---------------------------------------------------------------- diagnostics
@@ -395,6 +397,15 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 	}
 	rep.ContentNodes = len(contentIDs)
 
+	// The profile may allow fewer levels than the style table defines (a 报告
+	// with two levels, say). A deeper chapter would be numbered, then rendered
+	// with a style that does not exist. The plan carries the limit so this check
+	// uses the same value the prompt was given.
+	maxDepth := plan.MaxHeadingDepth
+	if maxDepth <= 0 || maxDepth > MaxHeadingDepth {
+		maxDepth = MaxHeadingDepth
+	}
+
 	// Recompose declarations define which nodes are allowed to appear as
 	// several output paragraphs. They are validated before the claim tally so
 	// the coverage rules can treat a recomposed node as a set of parts rather
@@ -622,7 +633,17 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 			if s.Level < 1 {
 				rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
 					Code: "bad_level", Severity: SevError,
-					Message: fmt.Sprintf("章节 %s 的层级 %d 非法（应为 1-4）", s.ID, s.Level),
+					Message: fmt.Sprintf("章节 %s 的层级 %d 非法（应为 1-%d）", s.ID, s.Level, maxDepth),
+					NodeIDs: []string{s.ID},
+				})
+				ok = false
+			}
+			if s.Level > maxDepth {
+				rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+					Code: "bad_level", Severity: SevError,
+					Message: fmt.Sprintf(
+						"章节 %s 的层级为 %d，超过这套体裁允许的 %d 级",
+						s.ID, s.Level, maxDepth),
 					NodeIDs: []string{s.ID},
 				})
 				ok = false
@@ -1214,6 +1235,52 @@ type VerbatimDiff struct {
 	// is intact), but they mean the plan asked for something impossible and
 	// the user should know.
 	Unapplied []UnappliedEdit `json:"unapplied,omitempty"`
+	// Rewrites describe every recomposed paragraph with its measured change,
+	// its register tier and the budget it was allowed. A rewrite over its
+	// budget, or one that dropped a hard fact, is a failure.
+	//
+	// This exists because "改动尽量少" cannot be enforced by checking that the
+	// model declared a rewrite — declaring it is what Recompose already does.
+	// The budget turns the promise into a number the gate can compare against.
+	Rewrites []RewriteCheck `json:"rewrites,omitempty"`
+}
+
+// RewriteCheck is the audit record for one rewritten paragraph.
+type RewriteCheck struct {
+	NodeID string `json:"node_id"`
+	// Tier is the register the source paragraph was read as.
+	Tier string `json:"tier"`
+	// TierLabel is the Chinese label for the tier, for the review panel.
+	TierLabel string `json:"tier_label"`
+	// Budget is the maximum change percentage allowed for that tier.
+	Budget int `json:"budget"`
+	// Change is the measured distance from source to output, 0-100.
+	Change int `json:"change"`
+	// OverBudget is true when Change exceeds Budget. Such a rewrite blocks
+	// the export.
+	OverBudget bool `json:"over_budget,omitempty"`
+	// MissingFacts are values present in the source but absent from the
+	// rewrite. A missing hard fact blocks the export; a soft fact only warns.
+	MissingFacts []FactLoss `json:"missing_facts,omitempty"`
+	// InventedFacts are hard facts the rewrite introduced that the source never
+	// contained. Every one blocks the export: a number the author did not
+	// write is a fabrication, however small the wording change was.
+	InventedFacts []FactLoss `json:"invented_facts,omitempty"`
+	// Reason is the model's own explanation, shown next to the numbers.
+	Reason string `json:"reason,omitempty"`
+}
+
+// FactLoss is one value a rewrite failed to preserve.
+//
+// Hard facts (numbers, dates, 发文字号) block the export: losing "2024年5月1日"
+// changes what the document says, which no amount of good prose repairs. Soft
+// facts (organisation names, quoted phrases) are surfaced for review, because
+// the extractor cannot always distinguish an organisation from an ordinary
+// noun.
+type FactLoss struct {
+	Kind string `json:"kind"`
+	Text string `json:"text"`
+	Hard bool   `json:"hard"`
 }
 
 // AppliedEdit records one declared change that reached the output.
@@ -1238,7 +1305,32 @@ type UnappliedEdit struct {
 // was made. Declared edits are permitted and are returned separately in
 // Changed for the user to review.
 func (v *VerbatimDiff) Clean() bool {
-	return v != nil && len(v.Missing) == 0 && len(v.Altered) == 0
+	return v != nil && len(v.Missing) == 0 && len(v.Altered) == 0 && len(v.RewriteFailures()) == 0
+}
+
+// RewriteFailures lists the rewrites that must block an export: those over
+// budget, and those that dropped a hard fact.
+func (v *VerbatimDiff) RewriteFailures() []string {
+	if v == nil {
+		return nil
+	}
+	var out []string
+	for _, r := range v.Rewrites {
+		if r.OverBudget {
+			out = append(out, fmt.Sprintf(
+				"%s: 改动 %d%%，超过「%s」段落允许的 %d%%",
+				r.NodeID, r.Change, r.TierLabel, r.Budget))
+		}
+		for _, f := range r.MissingFacts {
+			if f.Hard {
+				out = append(out, fmt.Sprintf("%s: 改后丢失原文数据「%s」", r.NodeID, f.Text))
+			}
+		}
+		for _, f := range r.InventedFacts {
+			out = append(out, fmt.Sprintf("%s: 改后出现原文没有的数据「%s」", r.NodeID, f.Text))
+		}
+	}
+	return out
 }
 
 // VerifyVerbatim compares an assembled document against its source, taking the
@@ -1394,6 +1486,14 @@ func VerifyVerbatim(doc *Document, out *Doc, plan *Plan) *VerbatimDiff {
 					After:  truncate(strings.Join(rec.Parts, "\n"), 120),
 					Reason: rec.Reason,
 				})
+
+				// Declaring a rewrite is not the same as being allowed to make
+				// it. Measure how far the output actually moved and refuse the
+				// ones that exceeded what the register of the source permits.
+				// Without this, Recompose is a hole in the "no silent change"
+				// guarantee: the model supplies both the replacement text and
+				// the value it is compared against.
+				diff.Rewrites = append(diff.Rewrites, checkRewrite(n.Text, rec, plan))
 				goto nextNode
 			}
 
@@ -1423,6 +1523,43 @@ func VerifyVerbatim(doc *Document, out *Doc, plan *Plan) *VerbatimDiff {
 					fmt.Sprintf("%s: 原文 %q → 输出 %q（未声明的修改）",
 						n.ID, truncate(expected, 60), truncate(got, 60)))
 				continue
+			}
+
+			// Declared edits are one more door into the same rewrite. A
+			// single edit whose Before is the whole paragraph and whose
+			// After is a different paragraph passes every check above —
+			// it is declared, it is found, and the output matches it —
+			// while bypassing the budget entirely. Measure what the edits
+			// did to the paragraph and apply the same limit.
+			if len(nodeEdits) > 0 && expected != n.Text && rewriteBudgetApplies(n.Text) &&
+				editCoverage(nodeEdits, n.Text) >= 0.4 {
+				assessment := style.Assess(n.Text)
+				limits := DefaultRewriteLimits()
+				if plan != nil {
+					limits = plan.RewriteLimits.Normalized()
+				}
+				budget := limits.MaxFor(assessment.Tier)
+				change := int(style.Distance(n.Text, expected) + 0.5)
+				check := RewriteCheck{
+					NodeID:     n.ID,
+					Tier:       string(assessment.Tier),
+					TierLabel:  assessment.Tier.Label(),
+					Budget:     budget,
+					Change:     change,
+					OverBudget: limits.Enabled && change > budget,
+					Reason:     "逐条声明修改后的整段改动幅度",
+				}
+				for _, lost := range style.MissingFacts(n.Text, expected) {
+					check.MissingFacts = append(check.MissingFacts, FactLoss{
+						Kind: lost.Kind, Text: lost.Text, Hard: lost.Hard,
+					})
+				}
+				for _, added := range style.InventedFacts(n.Text, expected) {
+					check.InventedFacts = append(check.InventedFacts, FactLoss{
+						Kind: added.Kind, Text: added.Text, Hard: added.Hard,
+					})
+				}
+				diff.Rewrites = append(diff.Rewrites, check)
 			}
 
 			// Applied and matching: record it for the change log.
@@ -1579,4 +1716,79 @@ func maxCols(rows [][]string) int {
 		}
 	}
 	return n
+}
+
+// checkRewrite measures one recomposed paragraph against the budget its source
+// register earns.
+//
+// The budget comes from the plan, which the server fills from the user's
+// settings — never from the model, which cannot be allowed to raise its own
+// limit. A plan assembled without server involvement (tests, CLI use) falls
+// back to DefaultLimits, so the check is never silently absent.
+func checkRewrite(src string, rec Recompose, plan *Plan) RewriteCheck {
+	assessment := style.Assess(src)
+	limits := DefaultRewriteLimits()
+	if plan != nil {
+		limits = plan.RewriteLimits.Normalized()
+	}
+	budget := limits.MaxFor(assessment.Tier)
+
+	out := strings.Join(rec.Parts, "")
+	change := int(style.Distance(src, out) + 0.5)
+
+	check := RewriteCheck{
+		NodeID:     rec.NodeID,
+		Tier:       string(assessment.Tier),
+		TierLabel:  assessment.Tier.Label(),
+		Budget:     budget,
+		Change:     change,
+		OverBudget: limits.Enabled && change > budget,
+		Reason:     rec.Reason,
+	}
+	for _, lost := range style.MissingFacts(src, out) {
+		check.MissingFacts = append(check.MissingFacts, FactLoss{
+			Kind: lost.Kind, Text: lost.Text, Hard: lost.Hard,
+		})
+	}
+	for _, added := range style.InventedFacts(src, out) {
+		check.InventedFacts = append(check.InventedFacts, FactLoss{
+			Kind: added.Kind, Text: added.Text, Hard: added.Hard,
+		})
+	}
+	return check
+}
+
+// rewriteBudgetApplies reports whether a paragraph is substantial enough for
+// the character-overlap measure to mean anything.
+//
+// On a very short string the measure is not a proxy for "how much was
+// rewritten": "按排好工做，认真负则。" → "安排好工作，认真负责。" fixes three
+// typos and replaces six characters of twelve, which scores as a 50% rewrite
+// while being exactly the correction the user asked for. A budget applied there
+// would reject the product's least controversial feature. Real paragraphs — the
+// ones where a wholesale rewrite is a problem — are far longer than this.
+func rewriteBudgetApplies(src string) bool {
+	return len([]rune(strings.TrimSpace(src))) >= 30
+}
+
+// editCoverage is the share of the source that the declared edits delete.
+//
+// It answers "is this a patch or a replacement?". Patching a typo touches a
+// couple of characters; replacing a paragraph names the whole paragraph as
+// Before. Only the latter needs to be measured against the rewrite budget; if
+// every small correction were measured, a paragraph with several genuine typos
+// would fail the gate for being corrected.
+func editCoverage(edits []Edit, src string) float64 {
+	total := len([]rune(src))
+	if total == 0 {
+		return 0
+	}
+	covered := 0
+	for _, e := range edits {
+		covered += len([]rune(e.Before))
+	}
+	if covered > total {
+		covered = total
+	}
+	return float64(covered) / float64(total)
 }

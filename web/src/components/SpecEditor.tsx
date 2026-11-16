@@ -18,7 +18,10 @@ import {
   FONT_CHOICES,
   FONT_SIZE_ORDER,
   FONT_SIZE_POINTS,
+  BINDABLE_ROLES,
+  defaultOutline,
   ROLE_LABEL,
+  outlineOf,
   type Align,
   type FontSize,
   type LineRule,
@@ -33,11 +36,21 @@ import {
   LINE_RULES,
   styleSummary,
   validateSpec,
+  withHeadingForm,
+  withOutline,
   withPage,
   withStyle,
 } from '../lib/specEdit'
 import { useGov } from '../store/useGov'
-import { AlertBox, Field, Select, TextInput, type SelectItem } from '../ui/primitives'
+import {
+  AlertBox,
+  CheckboxField,
+  Field,
+  Select,
+  TextArea,
+  TextInput,
+  type SelectItem,
+} from '../ui/primitives'
 
 /**
  * 字号选项。
@@ -120,6 +133,7 @@ export default function SpecEditor({ spec, readOnly = false, onChange }: SpecEdi
   }
 
   const problems = useMemo(() => validateSpec(local), [local])
+  const outline = useMemo(() => outlineOf(local), [local])
   const problemsByRole = useMemo(() => {
     const m = new Map<string, string[]>()
     for (const p of problems) {
@@ -226,6 +240,163 @@ export default function SpecEditor({ spec, readOnly = false, onChange }: SpecEdi
               />
             </Field>
           ))}
+        </div>
+      </section>
+
+      {/* 体裁结构 */}
+      <section className="rounded-lg border border-border px-4 py-3.5">
+        <h4 className="mb-1 text-sm font-semibold">体裁结构</h4>
+        <p className="text-xs leading-relaxed text-muted">
+          这里决定这种文稿「应该长成什么结构」：要有哪些要素、章节怎么编号、最多分几级。
+          换一份配置就换一种文体，模型会按这份规则整理文档。
+        </p>
+
+        <div className="mt-3 flex flex-col gap-4">
+          <Field
+            label="必需要素"
+            hint="勾选这种文稿应当具备的要素。缺少时只提示，不阻止导出 —— 很多文稿本来就没有抄送或份号。"
+          >
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(120px,1fr))] gap-x-3 gap-y-2">
+              {BINDABLE_ROLES.map((role) => (
+                <CheckboxField
+                  key={role}
+                  isDisabled={readOnly}
+                  isSelected={(outline.required_elements ?? []).includes(role)}
+                  onChange={(checked) => {
+                    const cur = outline.required_elements ?? []
+                    const next = checked
+                      ? [...cur, role]
+                      : cur.filter((r) => r !== role)
+                    commit(withOutline(local, { required_elements: next }))
+                  }}
+                  label={ROLE_LABEL[role] ?? role}
+                />
+              ))}
+            </div>
+          </Field>
+
+          <div className="grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] gap-3">
+            <Field label="最多几级标题">
+              <Select
+                aria-label="最多几级标题"
+                isDisabled={readOnly}
+                value={String(outline.max_depth)}
+                onChange={(v) => {
+                  const depth = Number(v)
+                  const defaults = defaultOutline().heading_forms ?? []
+                  const forms = [...(outline.heading_forms ?? [])]
+                  while (forms.length < depth) {
+                    forms.push({ ...(defaults[forms.length] ?? { numeral: 'arabic', suffix: '.' }) })
+                  }
+                  commit(
+                    withOutline(local, {
+                      max_depth: depth,
+                      // 每一级都必须有编号形式；减少层级时多余的保留，方便改回去。
+                      heading_forms: forms,
+                    }),
+                  )
+                }}
+                items={[1, 2, 3, 4].map((n) => ({ value: String(n), label: `${n} 级` }))}
+              />
+            </Field>
+            <Field label="主送机关">
+              <CheckboxField
+                isDisabled={readOnly}
+                isSelected={outline.requires_recipient}
+                onChange={(v) =>
+                  commit(withOutline(local, { requires_recipient: v }))
+                }
+                label="必须有主送机关"
+              />
+            </Field>
+            <Field label="正文前言">
+              <CheckboxField
+                isDisabled={readOnly}
+                isSelected={outline.preamble}
+                onChange={(v) => commit(withOutline(local, { preamble: v }))}
+                label="主送机关下有一段不编号的引言"
+              />
+            </Field>
+          </div>
+
+          <div className="space-y-2">
+            <div className="text-sm font-medium">标题编号形式</div>
+            {(outline.heading_forms ?? []).slice(0, outline.max_depth).map((form, i) => (
+              <div
+                key={i}
+                className="grid grid-cols-[repeat(auto-fit,minmax(110px,1fr))] items-end gap-2"
+              >
+                <Field label={`第 ${i + 1} 级`}>
+                  <Select
+                    aria-label={`第 ${i + 1} 级编号数字`}
+                    isDisabled={readOnly}
+                    value={form.numeral}
+                    onChange={(v) =>
+                      commit(
+                        withHeadingForm(local, i, {
+                          numeral: v === 'arabic' ? 'arabic' : 'chinese',
+                        }),
+                      )
+                    }
+                    items={[
+                      { value: 'chinese', label: '中文数字（一、二）' },
+                      { value: 'arabic', label: '阿拉伯数字（1、2）' },
+                    ]}
+                  />
+                </Field>
+                <Field label="数字前">
+                  <TextInput
+                    type="text"
+                    disabled={readOnly}
+                    placeholder="例如 （"
+                    value={form.prefix ?? ''}
+                    onChange={(e) =>
+                      commit(withHeadingForm(local, i, { prefix: e.target.value }))
+                    }
+                  />
+                </Field>
+                <Field label="数字后">
+                  <TextInput
+                    type="text"
+                    disabled={readOnly}
+                    placeholder="例如 、"
+                    value={form.suffix ?? ''}
+                    onChange={(e) =>
+                      commit(withHeadingForm(local, i, { suffix: e.target.value }))
+                    }
+                  />
+                </Field>
+                <div className="pb-2 text-sm text-muted">
+                  示例：{form.prefix ?? ''}
+                  {form.numeral === 'arabic' ? '1' : '一'}
+                  {form.suffix ?? ''}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <Field
+            label="语言风格要求"
+            hint="会原样写进模型提示词。例如「庄重、简明，不使用第一人称」。"
+          >
+            <TextArea
+              rows={2}
+              disabled={readOnly}
+              value={outline.tone ?? ''}
+              onChange={(e) => commit(withOutline(local, { tone: e.target.value }))}
+            />
+          </Field>
+          <Field
+            label="附加要求"
+            hint="这类文稿的其它规矩，例如固定结尾用语、必须附上的内容。"
+          >
+            <TextArea
+              rows={3}
+              disabled={readOnly}
+              value={outline.guidance ?? ''}
+              onChange={(e) => commit(withOutline(local, { guidance: e.target.value }))}
+            />
+          </Field>
         </div>
       </section>
 

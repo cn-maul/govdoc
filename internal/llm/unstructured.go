@@ -6,6 +6,7 @@ import (
 
 	"govdoc/internal/docmodel"
 	"govdoc/internal/parse"
+	"govdoc/internal/style"
 )
 
 // runOnMinRunes is the length at which one paragraph stops being a normal
@@ -88,20 +89,33 @@ func recomposeTargets(doc *docmodel.Document) []docmodel.Node {
 // wording was not enough in practice: a real one-paragraph upload came back
 // as a single section with the whole paragraph untouched.
 func writeRunOnDirective(b *strings.Builder, doc *docmodel.Document) {
+	writeRunOnDirectiveWith(b, doc, PlanOptions{})
+}
+
+// writeRunOnDirectiveWith is the document-specific directive, including the
+// rewrite budget for each target. Telling the model "不要概括" did not stop it
+// from compressing in practice; giving it the measured register and the exact
+// percentage it may change does, because the export gate checks the same
+// number.
+func writeRunOnDirectiveWith(b *strings.Builder, doc *docmodel.Document, opts PlanOptions) {
 	targets := recomposeTargets(doc)
 	if len(targets) == 0 {
 		return
 	}
+	limits := opts.Limits.Normalized()
 	b.WriteString("\n【系统判定：本文档必须重建段落层次】\n")
 	b.WriteString("本文档没有标题样式，也没有层次序数，且以下段落是一段到底或长句堆叠：\n")
 	for _, node := range targets {
-		fmt.Fprintf(b, "  %s（%d 字）| %s\n",
-			node.ID, len([]rune(node.Text)), firstLine(node.Text, 72))
+		assessment := style.Assess(node.Text)
+		fmt.Fprintf(b, "  %s（%d 字，%s，最多可改 %d%%）| %s\n",
+			node.ID, len([]rune(node.Text)), assessment.Tier.Label(),
+			limits.MaxFor(assessment.Tier), firstLine(node.Text, 72))
 	}
 	b.WriteString(`必须执行：
 - 对上述每个节点使用 recompose，把它拆成 2～8 个语义完整、逻辑通顺的段落；
-  优先保留原句和原意，只做必要的断句、语序调整、重复删减和主语补足，
-  不得概括，不得增加原文没有的事实、数字、日期、机关、依据、承诺或要求。
+  按上面给出的改写上限执行：已经比较规范的少改，明显口语化的可以改写为公文语体。
+  不得概括，不得增加原文没有的事实、数字、日期、机关、依据、承诺或要求，
+  也不得丢掉原文已有的这些内容。
 - 新建 2～6 个章节（可按内容设置二级章节），标题简洁、符合公文风格；
   标题不得直接抄正文句子。
 - 首句若是“各……：”这类主送机关，必须单独拆成一段并令 roles 对应项为

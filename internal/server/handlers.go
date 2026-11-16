@@ -24,6 +24,7 @@ import (
 	"govdoc/internal/render/docx"
 	"govdoc/internal/render/preview"
 	"govdoc/internal/store"
+	"govdoc/internal/style"
 )
 
 // maxUploadBytes bounds an upload. 公文 are text documents; 32MiB leaves room
@@ -258,6 +259,14 @@ func (s *Server) currentAllowEdits() bool {
 	return s.allowEdits
 }
 
+// currentRewriteLimits returns the rewrite budget, normalized so a stored zero
+// cannot disable the check.
+func (s *Server) currentRewriteLimits() style.Limits {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rewrite.Normalized()
+}
+
 // settingsPath returns the settings file path, or "" when persistence is off.
 func (s *Server) settingsPath() string {
 	if s.cfg.Settings == nil {
@@ -298,6 +307,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		Direction:  s.currentSpec().Direction,
 		Spec:       s.currentSpec(),
 		AllowEdits: s.currentAllowEdits(),
+		Rewrite:    s.currentRewriteLimits(),
 		// The settings page needs the profile list to render, and carrying it
 		// here means one request populates the whole screen.
 		ActiveProfile: s.ActiveProfile(),
@@ -366,6 +376,27 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	if req.AllowEdits != nil {
 		s.allowEdits = *req.AllowEdits
 	}
+	if req.Rewrite != nil {
+		// Validate before storing: a negative or absurd budget would either
+		// disable the check or refuse every document, and both look like a bug
+		// to the person who typed the number.
+		//
+		// The range check runs on the raw values, not on Normalized(): that
+		// function clamps out-of-range numbers to the defaults, so checking
+		// afterwards would accept -1 as if it were 15 and silently store
+		// something the user did not ask for.
+		raw := *req.Rewrite
+		if raw.FormalMax < 0 || raw.FormalMax > 100 ||
+			raw.MixedMax < 0 || raw.MixedMax > 100 ||
+			raw.ColloquialMax < 0 || raw.ColloquialMax > 100 {
+			s.mu.Unlock()
+			writeError(w, http.StatusBadRequest, api.CodeBadRequest,
+				"改写幅度必须是 0–100 之间的百分比。")
+			return
+		}
+		lim := raw.Normalized()
+		s.rewrite = lim
+	}
 	llm := s.llm
 	dir := s.spec.Direction
 	allow := s.allowEdits
@@ -401,6 +432,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		Direction:     dir,
 		Spec:          s.currentSpec(),
 		AllowEdits:    allow,
+		Rewrite:       s.currentRewriteLimits(),
 		ActiveProfile: s.ActiveProfile(),
 		Profiles:      s.toAPIProfiles(),
 		Persistent:    !s.settingsDisabled(),
@@ -676,6 +708,12 @@ func (s *Server) handleStartPlan(w http.ResponseWriter, r *http.Request) {
 	// numbers its own chapters.
 	if req.Baseline {
 		plan := baseline.Build(sess.Doc)
+		spec, err := s.specForSession(sess)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, api.CodeBadRequest, err.Error())
+			return
+		}
+		plan = s.planWithServerPolicy(plan, spec)
 		report := docmodel.VerifyPlan(sess.Doc, plan)
 		_, _ = s.store.UpdateSession(sess.ID, func(sess *store.Session) {
 			sess.Plan, sess.Report = plan, report
@@ -735,6 +773,8 @@ func (s *Server) handleStartPlan(w http.ResponseWriter, r *http.Request) {
 	go s.runAnalysis(job, sess, analyzer, AnalysisOptions{
 		Hint:       req.Hint,
 		AllowEdits: allowEdits,
+		Outline:    s.outlineForSession(sess),
+		Limits:     s.currentRewriteLimits(),
 	})
 
 	writeJSON(w, http.StatusAccepted, api.PlanJobResponse{JobID: jobID})
@@ -747,6 +787,58 @@ type AnalysisOptions struct {
 	// AllowEdits permits the model to correct content, always through
 	// declared edits.
 	AllowEdits bool
+	// Outline is the structural rule set of the document's profile. It decides
+	// which elements are expected and how chapters are numbered.
+	Outline *gbstandard.Outline
+	// Limits is the rewrite budget, resolved once here so the prompt and the
+	// export gate cannot disagree.
+	Limits style.Limits
+}
+
+// outlineForSession returns the structural rules of the document's profile.
+//
+// The profile is the one the document was uploaded with, not the current
+// default: changing the default must not silently reorganise an existing
+// document, for the same reason it must not silently re-typeset one.
+func (s *Server) outlineForSession(sess *store.Session) *gbstandard.Outline {
+	spec, err := s.ProfileSpec(sess.ProfileID)
+	if err != nil {
+		outline := gbstandard.DefaultOutline()
+		return &outline
+	}
+	outline := spec.OutlineOf()
+	return &outline
+}
+
+// withServerRewriteLimits returns a copy of plan carrying the server's
+// authoritatively resolved budget and heading depth.
+//
+// Both values are policy, not something the client may propose: the plan
+// round-trips through the browser, so a caller could otherwise raise its own
+// budget or ask for five levels in a two-level document type.
+//
+// The copy matters: the plan may be the one stored on the session, and mutating
+// that would make an export silently change what a later review sees.
+func withServerRewriteLimits(plan *docmodel.Plan, limits style.Limits,
+	outline gbstandard.Outline) *docmodel.Plan {
+	if plan == nil {
+		return nil
+	}
+	clone := *plan
+	clone.RewriteLimits = limits.Normalized()
+	clone.MaxHeadingDepth = outline.Normalized().MaxDepth
+	return &clone
+}
+
+// planWithServerPolicy stamps every server-side rule onto a plan before it is
+// verified or rendered.
+//
+// Budget and heading depth are policy: they come from the settings and the
+// document's own profile, never from the browser. Applying them in one place
+// means the analysis, the PUT /plan round trip, the preview and the export all
+// judge a plan the same way.
+func (s *Server) planWithServerPolicy(plan *docmodel.Plan, spec gbstandard.Spec) *docmodel.Plan {
+	return withServerRewriteLimits(plan, s.currentRewriteLimits(), spec.OutlineOf())
 }
 
 // runAnalysis drives the analyzer and publishes progress. Every exit path
@@ -840,6 +932,12 @@ func (s *Server) handlePutPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	spec, err := s.specForSession(sess)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, api.CodeBadRequest, err.Error())
+		return
+	}
+	plan = *s.planWithServerPolicy(&plan, spec)
 	report := docmodel.VerifyPlan(sess.Doc, &plan)
 	_, _ = s.store.UpdateSession(sess.ID, func(sess *store.Session) {
 		sess.Plan, sess.Report = &plan, report
@@ -987,6 +1085,10 @@ func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The rewrite budget is a server-side policy, not part of what the client
+	// may propose. The plan in the request round-trips through the browser, so
+	// a caller could otherwise send an inflated limit and pass the export gate
+	// that exists to stop wholesale rewrites.
 	// The document's own profile, not the currently selected one: switching the
 	// default must not reformat a document that was already processed.
 	spec, err := s.specForSession(sess)
@@ -994,6 +1096,7 @@ func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, api.CodeBadRequest, err.Error())
 		return
 	}
+	plan = withServerRewriteLimits(plan, s.currentRewriteLimits(), spec.OutlineOf())
 
 	// assemble.Build re-verifies the plan and refuses a lossy one, so a
 	// hand-edited plan that dropped a paragraph cannot be exported even if
@@ -1097,7 +1200,11 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := assemble.Build(sess.Doc, sess.Plan, spec)
+	// Preview must apply the same budget as export: a document that renders
+	// here but is refused on download would show the user a layout they cannot
+	// actually produce.
+	res, err := assemble.Build(sess.Doc,
+		withServerRewriteLimits(sess.Plan, s.currentRewriteLimits(), spec.OutlineOf()), spec)
 	if err != nil {
 		writePreviewError(w, http.StatusBadRequest,
 			fmt.Sprintf("结构方案未通过校验，无法预览：%v", err))

@@ -9,11 +9,13 @@ import {
   EDITOR_ROLE_ORDER,
   FONT_SIZE_POINTS,
   isKnownFontSize,
+  outlineOf,
   ROLE_LABEL,
   trimNum,
   type Align,
   type FontSize,
   type LineRule,
+  type Outline,
   type ParaStyle,
   type Profile,
   type Role,
@@ -35,6 +37,11 @@ export function cloneSpec(spec: Spec): Spec {
     ...spec,
     page: { ...spec.page },
     styles,
+    outline: {
+      ...outlineOf(spec),
+      required_elements: [...(outlineOf(spec).required_elements ?? [])],
+      heading_forms: (outlineOf(spec).heading_forms ?? []).map((f) => ({ ...f })),
+    },
   }
 }
 
@@ -60,6 +67,26 @@ export function withStyle(
 export function withPage(spec: Spec, patch: Partial<Spec['page']>): Spec {
   const next = cloneSpec(spec)
   next.page = { ...next.page, ...patch }
+  return next
+}
+
+/** 改体裁结构（必需要素 / 编号形式 / 层级 / 风格要求）。 */
+export function withOutline(spec: Spec, patch: Partial<Outline>): Spec {
+  const next = cloneSpec(spec)
+  next.outline = { ...outlineOf(next), ...patch }
+  return next
+}
+
+/** 改某一级标题的编号形式。 */
+export function withHeadingForm(
+  spec: Spec,
+  index: number,
+  patch: Partial<NonNullable<Outline['heading_forms']>[number]>,
+): Spec {
+  const next = cloneSpec(spec)
+  const forms = [...(outlineOf(next).heading_forms ?? [])]
+  forms[index] = { ...(forms[index] ?? { numeral: 'chinese' }), ...patch }
+  next.outline = { ...outlineOf(next), heading_forms: forms }
   return next
 }
 

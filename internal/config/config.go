@@ -37,6 +37,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"govdoc/internal/style"
 )
 
 // ErrNoConfigDir is returned when no writable location can be determined, so
@@ -71,6 +73,12 @@ type File struct {
 	// install proposes corrections by default; only an explicit false keeps
 	// them off.
 	AllowEdits *bool `json:"allow_edits,omitempty"`
+	// Rewrite records how far the model may rewrite each register of prose.
+	//
+	// It is stored here rather than in a profile because it describes how much
+	// the user trusts the model, not what the document type looks like: the
+	// same 公文 profile can be used cautiously or boldly.
+	Rewrite style.Limits `json:"rewrite,omitempty"`
 	// ActiveProfile is the id of the profile applied to new uploads when the UI
 	// has not chosen one explicitly.
 	ActiveProfile string `json:"active_profile,omitempty"`

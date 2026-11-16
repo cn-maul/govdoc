@@ -28,6 +28,7 @@ import {
   type Recompose,
   type RenderResponse,
   type Report,
+  type RewriteLimits,
   type SpecResponse,
   type StageEvent,
   type StructureDiff,
@@ -307,6 +308,7 @@ export async function saveConfig(input: {
   apiKey?: string
   direction?: Direction
   allowEdits?: boolean
+  rewrite?: RewriteLimits
 }): Promise<boolean> {
   state.savingConfig = true
   try {
@@ -316,6 +318,7 @@ export async function saveConfig(input: {
     if (input.protocol !== undefined) req.protocol = input.protocol
     if (input.direction !== undefined) req.direction = input.direction
     if (input.allowEdits !== undefined) req.allow_edits = input.allowEdits
+    if (input.rewrite !== undefined) req.rewrite = input.rewrite
     // 只有用户真的敲了新密钥才提交，否则服务端保留原密钥。
     if (input.apiKey !== undefined && input.apiKey.trim() !== '') {
       req.api_key = input.apiKey.trim()
@@ -1213,6 +1216,13 @@ export function downloadRenderedFile(): void {
     notify('info', '还没有生成公文文档。请先点「生成公文文档」。')
     return
   }
+  // 逐字/改写比对没通过的文件不能下载：那份文件里有原文没有的内容，或某段
+  // 改写超出了允许幅度。生成的瞬间已经拦过一次，这里再拦一次是因为方案可能
+  // 在两次点击之间又被改过。
+  if (res.diff && !diffClean(res.diff)) {
+    notify('error', '这份成文没有通过逐字/改写比对，已暂停下载。请在「成文核对」里查看原因。')
+    return
+  }
   if (!reportOK(state.report)) {
     // 成文时的 report 与当前 report 可能不同（用户又改了方案），以当下的为准：
     // 方案已经不通过校验了，就不该再让用户拿走旧文件而以为它是合规的。
@@ -1255,6 +1265,9 @@ export const hasDownload = computed(() => state.render !== null && reportOK(stat
 /** 「下载公文文档」按钮不可用时的中文原因；可用时为空串。 */
 export const downloadBlockReason = computed(() => {
   if (state.render === null) return '还没有生成公文文档，请先点「生成公文文档」。'
+  if (state.render.diff && !diffClean(state.render.diff)) {
+    return '成文没有通过逐字/改写比对，已暂停下载：请查看「成文核对」中的偏差与超预算改写。'
+  }
   if (!reportOK(state.report)) {
     return `当前方案未通过校验，已暂停下载：${firstErrorText() || '请看校对区的错误清单。'}`
   }

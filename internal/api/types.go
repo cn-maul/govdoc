@@ -8,6 +8,7 @@ import (
 	"govdoc/internal/baseline"
 	"govdoc/internal/docmodel"
 	"govdoc/internal/gbstandard"
+	"govdoc/internal/style"
 )
 
 // ErrorBody is the single error shape every failing endpoint returns. A
@@ -77,6 +78,10 @@ type ConfigResponse struct {
 	Spec      gbstandard.Spec      `json:"spec"`
 	// AllowEdits reports whether the model may correct 错别字/语病/用词.
 	AllowEdits bool `json:"allow_edits"`
+	// Rewrite is how far the model may move the text of each register. It is
+	// the budget the export gate enforces, so the UI shows the same numbers
+	// the verifier will apply.
+	Rewrite style.Limits `json:"rewrite"`
 	// ActiveProfile is the profile applied to new uploads.
 	ActiveProfile string `json:"active_profile,omitempty"`
 	// Profiles is every available profile, so the settings page can list them
@@ -147,6 +152,8 @@ type ConfigRequest struct {
 	Direction *gbstandard.Direction `json:"direction,omitempty"`
 	// AllowEdits toggles whether the model may correct content.
 	AllowEdits *bool `json:"allow_edits,omitempty"`
+	// Rewrite updates the rewrite budget. Absent leaves it unchanged.
+	Rewrite *style.Limits `json:"rewrite,omitempty"`
 }
 
 // FontStatus reports whether one 公文 typeface is installed on this machine.

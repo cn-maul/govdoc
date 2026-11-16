@@ -110,6 +110,16 @@ func Build(doc *docmodel.Document, plan *docmodel.Plan, spec gbstandard.Spec) (*
 	out := &docmodel.Doc{Meta: plan.Meta, Blocks: a.blocks}
 	diff := docmodel.VerifyVerbatim(doc, out, plan)
 
+	// VerifyVerbatim is the export gate, not merely a report. Until this check
+	// existed, Build computed the diff and returned it while still reporting
+	// success, so an undeclared change or an over-budget rewrite produced a
+	// downloadable file that the UI then labelled as failing. Returning the
+	// diff is not a decision; refusing to render is.
+	if diff != nil && !diff.Clean() {
+		return &Result{Report: report, Diff: diff},
+			fmt.Errorf("%w: %s", ErrPlanNotRenderable, diffFailureSummary(diff))
+	}
+
 	// FailedEdits and Diff.Unapplied describe the same thing — declared edits
 	// that did not reach the text — so they must not disagree. The assembler
 	// only notices edits it tried to apply (via nodeText), so an edit the
@@ -139,6 +149,27 @@ func Build(doc *docmodel.Document, plan *docmodel.Plan, spec gbstandard.Spec) (*
 		Report:      report,
 		FailedEdits: failed,
 	}, nil
+}
+
+// diffFailureSummary turns a failed VerbatimDiff into one actionable sentence,
+// naming the first few concrete problems rather than a count.
+func diffFailureSummary(diff *docmodel.VerbatimDiff) string {
+	var parts []string
+	if len(diff.Missing) > 0 {
+		parts = append(parts, fmt.Sprintf("丢失 %d 处原文内容（如 %s）",
+			len(diff.Missing), diff.Missing[0]))
+	}
+	if len(diff.Altered) > 0 {
+		parts = append(parts, fmt.Sprintf("有 %d 处未声明的修改（如 %s）",
+			len(diff.Altered), diff.Altered[0]))
+	}
+	if failures := diff.RewriteFailures(); len(failures) > 0 {
+		parts = append(parts, fmt.Sprintf("改写超出允许范围：%s", failures[0]))
+	}
+	if len(parts) == 0 {
+		return "成品与原文的逐字比对未通过"
+	}
+	return strings.Join(parts, "；")
 }
 
 // assembler accumulates output blocks and tracks which source nodes have
@@ -659,6 +690,12 @@ func (a *assembler) numberFor(level int) string {
 	n := a.counters[level]
 	if n <= 0 {
 		n = 1
+	}
+	// The numbering form comes from the document type's outline, so a 报告 or a
+	// thesis can number its chapters its own way without touching this file.
+	// The 公文 default ("一、" "（一）" "1." "（1）") is unchanged.
+	if prefix := a.spec.OutlineOf().HeadingPrefix(level, n); prefix != "" {
+		return prefix
 	}
 	switch level {
 	case 1:

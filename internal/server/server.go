@@ -23,6 +23,7 @@ import (
 	"govdoc/internal/docmodel"
 	"govdoc/internal/gbstandard"
 	"govdoc/internal/store"
+	"govdoc/internal/style"
 )
 
 // Version is the application version reported by /api/health.
@@ -88,6 +89,10 @@ type Server struct {
 	// default of false silently produced an empty review list on every fresh
 	// install — indistinguishable from the feature being broken.
 	allowEdits bool
+	// rewrite is how far the model may move the text of each register. It is
+	// stored beside allowEdits because both describe how much the user trusts
+	// the model, not what the document type looks like.
+	rewrite style.Limits
 	// profiles are the available formatting rule sets and activeProfile is the
 	// one applied to new uploads. They live under the same mutex as spec because
 	// the settings endpoints change both, and a profile *is* a spec.
@@ -290,6 +295,10 @@ func (s *Server) loadSettings() {
 	if f.AllowEdits != nil {
 		s.allowEdits = *f.AllowEdits
 	}
+	if f.Rewrite.Enabled || f.Rewrite.FormalMax > 0 || f.Rewrite.MixedMax > 0 ||
+		f.Rewrite.ColloquialMax > 0 {
+		s.rewrite = f.Rewrite.Normalized()
+	}
 
 	// Profiles replace the single spec as the unit of formatting. The spec the
 	// server was constructed with becomes the 公文 profile's rules when no
@@ -305,6 +314,7 @@ func (s *Server) loadSettings() {
 		"key_set", s.llm.APIKey != "",
 		"direction", s.spec.Direction,
 		"allow_edits", s.allowEdits,
+		"rewrite", s.rewrite.Describe(),
 		"profiles", len(s.profiles),
 		"active_profile", s.activeProfile)
 }
@@ -386,6 +396,7 @@ func (s *Server) persistSettings() error {
 		f.APIKey = s.llm.APIKey
 		f.Direction = string(s.spec.Direction)
 		f.AllowEdits = &s.allowEdits
+		f.Rewrite = s.rewrite
 	})
 }
 

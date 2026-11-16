@@ -6,7 +6,9 @@ import (
 	"strings"
 
 	"govdoc/internal/docmodel"
+	"govdoc/internal/gbstandard"
 	"govdoc/internal/parse"
+	"govdoc/internal/style"
 )
 
 // systemPrompt states the task and the rule the whole project rests on.
@@ -22,7 +24,17 @@ import (
 // both, an *undeclared* change fails verification. Allowing edits widens what
 // the model may propose, never what may happen silently.
 func systemPrompt(doc *docmodel.Document, allowEdits bool) string {
+	return systemPromptWith(doc, PlanOptions{AllowEdits: allowEdits})
+}
+
+// systemPromptWith builds the system prompt for one document type.
+//
+// The document-type rules come from the profile's Outline rather than from
+// literals here: a 报告 is not organised like a 公文, and the person running
+// this tool must be able to change those rules without editing Go source.
+func systemPromptWith(doc *docmodel.Document, opts PlanOptions) string {
 	var b strings.Builder
+	allowEdits := opts.AllowEdits
 	b.WriteString(`你是一名中国政府公文处理专家，熟悉《党政机关公文格式》GB/T 9704-2012。
 
 你的任务：读懂给定文档的内容与逻辑，把它梳理成一份层次正确的公文结构方案（章节树）。
@@ -83,16 +95,15 @@ func systemPrompt(doc *docmodel.Document, allowEdits bool) string {
 相同输入必须得到相同结构。请严格按下面的固定规则判断，不要按语义“感觉”另分章节：
 - 原文已有 Word 标题样式时，该样式就是层级依据，不得重新解释它的高低。
 - 没有标题样式、但行首是层次序数时，按序数固定映射：
-    一、二、三、…… → level 1
-    （一）（二）（三）…… → level 2
-    1. 2. 3. …… → level 3
-    （1）（2）（3）…… → level 4
+`)
+	b.WriteString(headingFormHint(opts.Outline))
+	b.WriteString(`
 - 一个正文段落归属于“在它前面、且距离最近”的那一个标题；不得为了凑结构把它
   移到后面的章节，也不得调换章节或段落的原文顺序。
 - 原文没有标题样式、也没有层次序数时：
     · 若正文已是多个完整段落，可以按语义归组并新建简洁章节标题，但必须用
       body_node_ids 整段引用，不得改写段落内容；
-    · 若正文是一段到底或长句堆叠，按下面的【无结构文档】用 recompose
+    · 若正文是一段到底或长句堆叠，按下面的【段落重组】用 recompose
       重建段落与章节；
     · 不得只凭“感觉”把一段正常短段落强行拆成多段。
 - 不得把普通正文段落识别成标题；只有标题样式或行首层次序数才能作为标题证据。
@@ -102,7 +113,9 @@ func systemPrompt(doc *docmodel.Document, allowEdits bool) string {
 - 每个章节的 preserve_order 一律为 true。
 
 【章节层次】
-- level 1 ～ 4 分别对应公文层次序数：一、/（一）/ 1. / （1）。
+`)
+	b.WriteString(headingFormHint(opts.Outline))
+	b.WriteString(`
 - 子章节的 level 必须大于其父章节的 level。
 - 如果原文中已有标题段落（kind 为 heading），请用 heading_node_id 指向它，
   并且该章节的 title 必须与那段原文**完全一致**。不要另造一个名字。
@@ -113,10 +126,15 @@ func systemPrompt(doc *docmodel.Document, allowEdits bool) string {
 
 	if allowEdits {
 		b.WriteString(`
-【无结构文档：可以声明重组，但必须克制】
-只有当原文**整篇没有任何标题样式、也没有任何层次序数**（即整篇没有结构证据），
-且正文存在明显的“一段到底”或长句堆叠时，才可以使用 recompose。
-有结构证据的文档一律不要用 recompose：那种文档只需要归组，不需要重写。
+【段落重组：按段落判断，受幅度上限约束】
+recompose 的用途是把一个**需要重写的原始段落**改写成若干段。判断对象是段落，不是整篇：
+- 可以用：某一段明显口语化、句子散乱、或一段里挤了多件事，需要断句、分段、
+  改写成公文语体。整篇有没有章节标题都不影响这一条 —— 有标题的文档也可以只
+  重组其中口语化的段落。
+- 不要用：段落本来通顺规范，你只是想让它更好看；或者原文已有结构、只需归组。
+  这类段落应当用 body_node_ids 整段引用，一个字都不改。
+- 能改多少由【改写幅度上限】决定：已规范的段落只有很小的空间，明显口语的段落
+  才可以大改。系统会逐段核对，超出上限的方案会被拒绝导出。
 
 recompose 的写法是：对某个原文节点声明它将被改写成若干段，并在章节的
 body_parts 里逐段放置：
@@ -154,9 +172,9 @@ body_parts 里逐段放置：
 `)
 	} else {
 		b.WriteString(`
-【无结构文档】
+【段落重组】
 用户已关闭原文修改，因此**不得**使用 recompose，也不得合并、拆分或改写任何段落。
-即使原文只有一段，也只能原样放入一个章节。
+即使原文只有一段、而且很口语化，也只能原样放入一个章节。
 `)
 	}
 
@@ -218,6 +236,96 @@ JSON 结构：
   ],
   "notes": ["你对结构判断的简短说明，或存疑之处"]
 }
+`)
+	b.WriteString(outlinePrompt(opts.Outline, opts.Limits, allowEdits))
+	return b.String()
+}
+
+// headingFormHint renders the level→numbering table from the profile.
+//
+// The model needs this table twice: once to recognise existing hand-typed
+// numbering in the source, and once to know which level to assign. It used to
+// be the literal 公文 sequence, which silently overrode any custom profile.
+func headingFormHint(o *gbstandard.Outline) string {
+	outline := gbstandard.DefaultOutline()
+	if o != nil {
+		outline = o.Normalized()
+	}
+	var b strings.Builder
+	for i := 0; i < outline.MaxDepth && i < len(outline.HeadingForms); i++ {
+		form := outline.HeadingForms[i]
+		// A form such as 一、 is shown as "一、二、三、……" so the model sees a
+		// sequence rather than one sample and does not mistake it for a literal.
+		nums := []string{form.Render(1), form.Render(2), form.Render(3)}
+		fmt.Fprintf(&b, "    %s…… → level %d\n", strings.Join(nums, " "), i+1)
+	}
+	b.WriteString("  上面没有列出的编号形式一律不算标题证据。\n")
+	return b.String()
+}
+
+// outlinePrompt renders the document type's structural rules for the model.
+//
+// Until this existed the rules lived in the literal strings above, which meant
+// every document was organised as a 公文 and a new document type required a code
+// change. They are now data: the profile decides which elements are expected,
+// how deep the tree may go, and how far a rewrite may move the text.
+func outlinePrompt(o *gbstandard.Outline, limits style.Limits, allowEdits bool) string {
+	outline := gbstandard.DefaultOutline()
+	if o != nil {
+		outline = o.Normalized()
+	}
+	var b strings.Builder
+
+	b.WriteString("\n【本文档类型：结构要求】\n")
+	if len(outline.RequiredElements) > 0 {
+		var names []string
+		for _, r := range outline.RequiredElements {
+			names = append(names, string(r))
+		}
+		fmt.Fprintf(&b, "本文档类型通常应包含这些要素：%s。原文中已有的，必须用 elements 绑定；原文没有的，不要凭空生成。\n",
+			strings.Join(names, "、"))
+	}
+	if outline.RequiresRecipient {
+		b.WriteString("主送机关是必需要素。若原文首句是“各……：”这类称呼，请绑定或拆分到 recipient。\n")
+	}
+	if outline.Preamble {
+		b.WriteString("主送机关之后、第一个章节之前允许有一段不带编号的正文前言（缘由段），放进 preamble_node_ids。\n")
+	}
+	fmt.Fprintf(&b, "标题最多 %d 级。各级编号形式：", outline.MaxDepth)
+	for i := 0; i < outline.MaxDepth && i < len(outline.HeadingForms); i++ {
+		fmt.Fprintf(&b, " 第%d级「%s」", i+1, outline.HeadingForms[i].Render(i+1))
+	}
+	b.WriteString("。系统会按这个形式自动编号，你只需给出层级，不要在标题文字里自己写编号。\n")
+	if strings.TrimSpace(outline.Tone) != "" {
+		fmt.Fprintf(&b, "语言风格要求：%s\n", strings.TrimSpace(outline.Tone))
+	}
+	if strings.TrimSpace(outline.Guidance) != "" {
+		fmt.Fprintf(&b, "附加要求：%s\n", strings.TrimSpace(outline.Guidance))
+	}
+
+	if !allowEdits {
+		b.WriteString("\n本次不允许改写原文，因此上述编号层级仍按结构要求执行，但不得改动任何文字。\n")
+		return b.String()
+	}
+
+	// The budget is the part that makes "尽量少改" enforceable. Stating it as
+	// percentages per register, rather than as an adjective, also tells the
+	// model that a well-written paragraph has almost no room.
+	l := limits.Normalized()
+	b.WriteString("\n【改写幅度上限】\n")
+	fmt.Fprintf(&b, "系统会逐段判断原文口径，并按下面的上限校验你的改写；超出会被拒绝导出：\n")
+	fmt.Fprintf(&b, "  · 已规范（本来就接近公文语体）：最多改动 %d%%\n", l.FormalMax)
+	fmt.Fprintf(&b, "  · 一般书面（通顺但不够正式）：最多改动 %d%%\n", l.MixedMax)
+	fmt.Fprintf(&b, "  · 偏口语（明显口头表达）：最多改动 %d%%\n", l.ColloquialMax)
+	b.WriteString(`处理原则：
+- 先判断这一段的语言已经有多规范，再决定改多少。**已经写得规范的就少改**，
+  只修错别字、语病和不通顺之处；明显口语化、句子散乱、一段到底的，才可以
+  大幅改写为公文语体。
+- 无论改动多少，原文中的数字、日期、发文字号、金额、比例、机关名称、
+  文件依据和承诺要求**一个都不能少、一个都不能改、也不能新增**。
+  系统会逐项比对，丢失或新增数据会直接拒绝导出。
+- 不得概括、不得压缩信息量、不得把多段合成一段而丢掉内容。
+- 改写只改变表述方式，不改变原文的事实与结论。
 `)
 	return b.String()
 }
@@ -293,7 +401,16 @@ func writeStructureHints(b *strings.Builder, doc *docmodel.Document) {
 // consume the context window and tell the model nothing about the chapter
 // structure that its caption does not already say.
 func buildUserPrompt(doc *docmodel.Document, hint string, allowEdits bool) string {
+	return buildUserPromptWith(doc, PlanOptions{Hint: hint, AllowEdits: allowEdits})
+}
+
+// buildUserPromptWith renders the per-document half of the prompt.
+//
+// It reads the same PlanOptions as the system prompt so the two halves cannot
+// disagree about the budget or the document type.
+func buildUserPromptWith(doc *docmodel.Document, opts PlanOptions) string {
 	var b strings.Builder
+	hint, allowEdits := opts.Hint, opts.AllowEdits
 
 	fmt.Fprintf(&b, "文档名称：%s\n", doc.SourceName)
 	fmt.Fprintf(&b, "共 %d 个段落，其中需要收录的正文段落 %d 个。\n\n",
@@ -310,7 +427,7 @@ func buildUserPrompt(doc *docmodel.Document, hint string, allowEdits bool) strin
 
 	writeStructureHints(&b, doc)
 	if needsRecompose(doc, allowEdits) {
-		writeRunOnDirective(&b, doc)
+		writeRunOnDirectiveWith(&b, doc, opts)
 	}
 
 	b.WriteString("段落清单（格式：编号 | 类型 | 内容）：\n")

@@ -167,6 +167,19 @@ func (b builder) build() Spec {
 		PageNumberSize: SizeWuhao,
 		PageNumberFont: FontSongti,
 		PageNumberDash: "",
+		Outline: Outline{
+			RequiredElements:  []docmodel.Role{docmodel.RoleTitle},
+			HeadingForms: []HeadingForm{
+				{Numeral: "chinese", Suffix: "、"},
+				{Numeral: "chinese", Prefix: "（", Suffix: "）"},
+				{Numeral: "arabic", Suffix: "."},
+				{Numeral: "arabic", Prefix: "（", Suffix: "）"},
+			},
+			MaxDepth:          4,
+			Preamble:          false,
+			RequiresRecipient: false,
+			Tone:              "简洁、准确、条理清楚的书面语；不使用口语与语气词",
+		},
 	}
 }
 

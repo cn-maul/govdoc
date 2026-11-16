@@ -12,7 +12,7 @@
 | 前端 | React 19 + TypeScript + Tailwind CSS v4 + HeroUI v3（见 `docs/DESIGN_heroUI.md`） |
 | 前端产物 | `web/dist` → 由 `internal/server` 用 `//go:embed` 嵌入 |
 | 格式标准 | 《党政机关公文格式》GB/T 9704-2012 |
-| 核心不变式 | **改动必须显式声明、可见、可审计**：原文可以被修正，但每一处修正都必须是一条 `docmodel.Edit`（带 before/after/理由），未声明的改写仍会导致导出被拒 |
+| 核心不变式 | **改动必须显式声明、可见、可审计，并受幅度上限约束**：原文可以被修正或按段落改写，但每条 `Edit` / `Recompose` 都必须带理由，未声明的改写、超预算的改写、丢失或杜撰数据的改写都会导致导出被拒 |
 
 ## 1. 数据契约（已完成，冻结）
 
@@ -50,8 +50,7 @@
 
 #### 整段重组（`Plan.Recompose` + `Section.BodyParts`）
 
-一份「整篇一段到底」、没有任何层次证据的文档，可以重建章节；但一个原文节点只能
-作为一个整体被引用一次，无法直接表达「拆成多段、放进多个章节」。为此：
+一个原文节点只能作为一个整体被引用一次，无法直接表达「拆成多段、放进多个章节」。为此：
 
 ```go
 type Recompose struct {
@@ -78,6 +77,46 @@ type BodyPart struct {
   直接写进 `parts`）；
 - 表格、图片不能重组；`parts` 中不得有空段；
 - 重组后字数低于原文约 60% 时产生 `heavy_recompose` 警告，提示可能是在概括而非整理。
+
+**触发范围是按段落，不是按整篇。** 早期实现只在「整篇无标题、无层次序数」时才允许
+重组，导致「有标题但正文口语化」的文档无法改写。现在只要某一段确实需要重写就可以
+声明重组；是否允许、能改多少由幅度上限决定，而不是由整篇是否有结构决定。
+
+#### 改写幅度上限（`style.Limits`）
+
+「尽量少改」必须是可核对的数字，否则模型可以整段替换而无人发现。规则：
+
+- 每段原文先由 `style.Assess` 判定口径：`formal`（已规范）/ `mixed`（一般书面）/
+  `colloquial`（偏口语）；
+- 上限按档配置（`formal_max` / `mixed_max` / `colloquial_max`，0–100），默认 15 / 35 / 100；
+- 改动幅度由 `style.Distance` 计算：字符 bigram 的 Dice 系数，忽略空白与标点；
+- 超出上限、或丢失硬事实（数字/日期/发文字号/金额/比例/引语）→ `VerbatimDiff.Clean()` 为假，
+  `assemble.Build` 拒绝生成；
+- **两条改写路径都要计量**：`Plan.Recompose` 与「一整段作为 before 的 `Plan.Edit`」。
+  只检查前者会留下一个完整绕过口子；
+- 限额是服务端策略，`handleRender` / `handlePreview` 用 `withServerRewriteLimits`
+  覆盖客户端传来的 `plan.rewrite_limits`，客户端无法自行放宽。
+
+### 1.3 体裁结构（`gbstandard.Outline`）
+
+文稿的结构规则随 profile 走，不再写死在提示词里：
+
+```go
+type Outline struct {
+    RequiredElements  []docmodel.Role
+    HeadingForms      []HeadingForm // 每级：numeral(chinese|arabic) + prefix + suffix
+    MaxDepth          int
+    Preamble          bool
+    RequiresRecipient bool
+    Tone              string
+    Guidance          string
+}
+```
+
+`Spec.Outline` 与排版参数同属一个对象，`Spec.OutlineOf()` 对旧配置回退到
+`DefaultOutline()`。提示词中的层级表、编号形式、必需要素与语言风格全部由它生成，
+`assemble` 的层次序数也读同一个 `HeadingPrefix`，因此「配置的编号」与「成品里的编号」
+不可能不一致。
 
 用户在校对区逐条「同意/不同意」：同意才把 `recompose` 与 `body_parts` 一起写回方案，
 不同意则保留原文。重组的改动在导出日志中记为 `kind = "recompose"`，标签为「重组段落」。

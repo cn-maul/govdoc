@@ -401,13 +401,50 @@ export interface VerbatimDiff {
   changed?: AppliedEdit[]
   /** 未生效的改动（before 未找到）。 */
   unapplied?: UnappliedEdit[]
+  /** 每处重写的改动幅度与事实校验，供校对区逐条展示。 */
+  rewrites?: RewriteCheck[]
 }
 
 /**
- * VerbatimDiff.Clean()：无缺失、无未声明改写。**已声明的改动不算失败**。
+ * RewriteCheck 是一处「整段重写」的审计记录（对应 docmodel.RewriteCheck）。
+ *
+ * 关键点：`change` 是实测的改动幅度，`budget` 是这类文本允许的上限。
+ * `over_budget` 为 true 时服务端会拒绝导出——所以界面必须把它显示出来，
+ * 否则用户只看到「导出失败」却不知道哪一段改多了。
+ */
+export interface RewriteCheck {
+  node_id: string
+  /** formal / mixed / colloquial。 */
+  tier: string
+  /** 中文口径名：已规范 / 一般书面 / 偏口语。 */
+  tier_label: string
+  budget: number
+  change: number
+  over_budget?: boolean
+  /** 改后丢失的原文字段（number/date/docno 为硬事实，必须为空）。 */
+  missing_facts?: FactLoss[]
+  /** 改后出现、原文没有的数字类内容。 */
+  invented_facts?: FactLoss[]
+  reason?: string
+}
+
+/** FactLoss 是重写未保住（或凭空添加）的一处原文数据。 */
+export interface FactLoss {
+  kind: string
+  text: string
+  hard: boolean
+}
+
+/**
+ * VerbatimDiff.Clean()：无缺失、无未声明改写、无超预算重写。
+ * **已声明且未超预算的改动不算失败**。
  */
 export function diffClean(d: VerbatimDiff | null | undefined): boolean {
-  return !!d && (d.missing?.length ?? 0) === 0 && (d.altered?.length ?? 0) === 0
+  if (!d) return false
+  if ((d.missing?.length ?? 0) > 0 || (d.altered?.length ?? 0) > 0) return false
+  return !(d.rewrites ?? []).some(
+    (r) => r.over_budget || (r.missing_facts ?? []).some((f) => f.hard),
+  )
 }
 
 // ---------------------------------------------------------------- gbstandard
@@ -468,6 +505,87 @@ export interface Spec {
   page_number_size: FontSize
   page_number_font: string
   page_number_dash: string
+  /**
+   * 体裁结构：这种文稿应当有哪些要素、标题怎么编号、最多几级。
+   *
+   * 旧配置里没有这一块，读取时用 defaultOutline() 补齐 —— 服务端也会做同样
+   * 的归一化，所以界面上看到的默认值与真正生效的规则一致。
+   */
+  outline?: Outline
+}
+
+/** HeadingForm 是一级标题的编号形式，例如中文数字 + 「、」。 */
+export interface HeadingForm {
+  /** chinese = 一、二、；arabic = 1、2。 */
+  numeral: 'chinese' | 'arabic'
+  /** 数字前面的字符，例如「（」。 */
+  prefix?: string
+  /** 数字后面的字符，例如「、」。 */
+  suffix?: string
+}
+
+/**
+ * Outline 描述一类文稿的结构规则（对应 gbstandard.Outline）。
+ *
+ * 它和排版规则放在同一份 profile 里：换一种文体，既是换字体字号，也是换
+ * 「要不要主送机关、章节怎么编号、允许多少级」。
+ */
+export interface Outline {
+  /** 必须出现的要素；缺了只提示，不阻止导出（很多文稿本来就没有抄送）。 */
+  required_elements?: Role[]
+  /** 每一级的编号形式，下标 0 为一级标题。 */
+  heading_forms?: HeadingForm[]
+  max_depth: number
+  /** 是否应有一段不带编号的正文前言。 */
+  preamble: boolean
+  /** 主送机关是否必填。 */
+  requires_recipient: boolean
+  /** 语言风格要求，会原样写进模型提示词。 */
+  tone?: string
+  /** 这类文稿的附加要求（本单位习惯、行业规范等）。 */
+  guidance?: string
+}
+
+/** 公文默认体裁结构，与服务端 gbstandard.DefaultOutline 保持一致。 */
+export function defaultOutline(): Outline {
+  return {
+    required_elements: ['title', 'recipient', 'date'],
+    heading_forms: [
+      { numeral: 'chinese', suffix: '、' },
+      { numeral: 'chinese', prefix: '（', suffix: '）' },
+      { numeral: 'arabic', suffix: '.' },
+      { numeral: 'arabic', prefix: '（', suffix: '）' },
+    ],
+    max_depth: 4,
+    preamble: true,
+    requires_recipient: true,
+    tone: '庄重、简明、规范的公文语体；不口语化，不使用第一人称叙述，不添加原文没有的事实与承诺',
+    guidance: '',
+  }
+}
+
+/** 取一份可安全编辑的体裁结构；旧配置没有 outline 时返回公文默认值。 */
+export function outlineOf(spec: Spec | undefined | null): Outline {
+  const d = defaultOutline()
+  const o = spec?.outline
+  if (!o) return d
+  const forms =
+    o.heading_forms && o.heading_forms.length > 0
+      ? o.heading_forms.map((f) => ({ ...f }))
+      : d.heading_forms!.map((f) => ({ ...f }))
+  const depth = Math.max(1, o.max_depth || forms.length)
+  // 每一级都要有编号形式：旧配置可能只有两级，增加层级时不能留下空编号。
+  while (forms.length < depth) {
+    const fallback = d.heading_forms![forms.length] ?? { numeral: 'arabic', suffix: '.' }
+    forms.push({ ...fallback })
+  }
+  return {
+    ...d,
+    ...o,
+    required_elements: o.required_elements ?? d.required_elements,
+    heading_forms: forms,
+    max_depth: Math.min(depth, forms.length),
+  }
 }
 
 // ---------------------------------------------------------------- profile
@@ -691,6 +809,8 @@ export interface ConfigResponse {
   spec: Spec
   /** 是否允许模型修正错别字/语病/用词（服务端保存的偏好）。 */
   allow_edits: boolean
+  /** 各类文本允许模型改动的百分比上限。 */
+  rewrite: RewriteLimits
   /** 新上传文档默认使用哪套排版规则。 */
   active_profile?: string
   /** 全部可用规则，设置页无需第二次请求即可渲染列表。 */
@@ -717,6 +837,21 @@ export interface ConfigRequest {
   direction?: Direction
   /** 是否允许模型修正正文内容。 */
   allow_edits?: boolean
+  /** 更新改写幅度上限。缺省表示不改。 */
+  rewrite?: RewriteLimits
+}
+
+/**
+ * RewriteLimits 是「某类文本最多能改多少」的配置（对应 style.Limits）。
+ *
+ * 三个数字按原文语言的口语程度分级：已经规范的公文只能小改，明显口语的
+ * 才允许大改。这正是「尽量少改动」的具体执行标准。
+ */
+export interface RewriteLimits {
+  enabled: boolean
+  formal_max: number
+  mixed_max: number
+  colloquial_max: number
 }
 
 /** FontStatus 报告某款公文字体在本机是否可用。 */
