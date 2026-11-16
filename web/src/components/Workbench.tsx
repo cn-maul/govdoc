@@ -7,14 +7,33 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button, Switch, cn } from '@heroui/react'
-import { editLabel, type Edit, type NodeSummary } from '../api/types'
-import { headingTag, outlineFromNodes, outlineFromPlan, type OutlineItem } from '../lib/headings'
+import {
+  editLabel,
+  type BodyOrder,
+  type Edit,
+  type ElementChange,
+  type Meta,
+  type MetaChange,
+  type NodeSummary,
+  type SectionChange,
+  type SectionMove,
+  type StructureMove,
+} from '../api/types'
+import {
+  headingTag,
+  levelLabel,
+  outlineFromNodes,
+  outlineFromPlan,
+  type OutlineItem,
+} from '../lib/headings'
 import { readFrameSelection, type SelectionMatch } from '../lib/selection'
 import {
   acceptDeclaredEdit,
   acceptPendingEdit,
   acceptRecompose,
+  acceptStructure,
   dismissPendingEdit,
+  dissolveSynthesizedSection,
   editSignature,
   gov,
   loadSource,
@@ -23,6 +42,19 @@ import {
   rejectDeclaredEdit,
   rejectRecompose,
   requestRevision,
+  restoreBodyOrder,
+  restoreElementBinding,
+  restoreElementToBody,
+  restoreMetaField,
+  restoreMissingSection,
+  restoreMoveTarget,
+  restorePreambleOrder,
+  restoreSectionLevel,
+  restoreSectionOrder,
+  restoreSectionParent,
+  restoreSectionShape,
+  restoreSectionTitle,
+  revertAddedSectionToBody,
   startAnalysis,
   uploadDocument,
 } from '../store/govdoc'
@@ -161,7 +193,13 @@ function OutlineRail({
   )
 }
 
-/** 一条待审综合项：文字改动或整段重组。 */
+/**
+ * 一条待审综合项。
+ *
+ * 校对区原先只收文字改动与整段重组，于是模型搬段、加章、改标题、把段落绑成
+ * 公文要素这些**结构**上的动作一个都不会出现在这里 —— 用户只能靠肉眼比对。
+ * 结构项因此也是一等条目，并且带一个可执行的还原动作。
+ */
 type ReviewItem =
   | { kind: 'edit'; edit: Edit; pending: boolean; index: number; provisional: boolean }
   | {
@@ -171,6 +209,12 @@ type ReviewItem =
       index: number
       provisional: boolean
     }
+  | { kind: 'move'; move: StructureMove; provisional: boolean }
+  | { kind: 'section'; change: SectionChange; provisional: boolean }
+  | { kind: 'section-move'; move: SectionMove; provisional: boolean }
+  | { kind: 'element'; binding: ElementChange; provisional: boolean }
+  | { kind: 'meta'; change: MetaChange; provisional: boolean }
+  | { kind: 'body-order'; order: BodyOrder; provisional: boolean }
 
 /** 待审改动：同意即写入方案，不同意直接丢掉。 */
 function ReviewList() {
@@ -198,13 +242,41 @@ function ReviewList() {
     provisional: false,
   }))
 
-  const recompose: ReviewItem[] = gov.pendingRecompose.map((item, index) => ({
+  const recompose = gov.pendingRecompose.map<ReviewItem>((item, index) => ({
     kind: 'recompose',
     rec: item.recompose,
     pending: item,
     index,
     provisional: false,
   }))
+
+  // 结构调整：换章节、章节增删改名/改层级、整章换位置、要素绑定、自拟要素、
+  // 节内与前言顺序。它们同样必须逐条出现在校对栏，而不是只在别处汇总。
+  const structure = useMemo<ReviewItem[]>(() => {
+    const diff = gov.structure
+    if (!diff) return []
+    const handled = new Set(gov.handledStructure)
+    const out: ReviewItem[] = []
+    const push = (item: ReviewItem): void => {
+      if (!handled.has(reviewKey(item))) out.push(item)
+    }
+
+    // 原文没有分章时，moves 已由服务端按「归入哪一章」汇总，仍然要显示：
+    // 否则这种最常见的上传会一条结构项都没有。
+    for (const move of diff.moves ?? []) push({ kind: 'move', move, provisional: false })
+    if (!diff.baseline_flat) {
+      for (const move of diff.moved_sections ?? []) {
+        push({ kind: 'section-move', move, provisional: false })
+      }
+    }
+    for (const change of diff.sections ?? []) {
+      push({ kind: 'section', change, provisional: false })
+    }
+    for (const binding of diff.elements ?? []) push({ kind: 'element', binding, provisional: false })
+    for (const change of diff.meta ?? []) push({ kind: 'meta', change, provisional: false })
+    for (const order of diff.body_orders ?? []) push({ kind: 'body-order', order, provisional: false })
+    return out
+  }, [gov.structure, gov.handledStructure])
 
   // 生成中的校对项先显示出来，但不允许处理：此时方案还没有通过最终校验，
   // 同意一条也只会写进一份尚未完整的方案。
@@ -227,28 +299,47 @@ function ReviewList() {
           })),
         ]
       : []
-  const items = gov.analyzing ? streaming : [...recompose, ...pending, ...declared]
+  const items = gov.analyzing
+    ? streaming
+    : [...structure, ...recompose, ...pending, ...declared]
 
   async function accept(item: ReviewItem): Promise<void> {
     const key = reviewKey(item)
     setBusy(key)
-    if (item.kind === 'recompose') await acceptRecompose(item.index)
-    else if (item.pending) await acceptPendingEdit(item.index)
-    else await acceptDeclaredEdit(item.edit)
+    switch (item.kind) {
+      case 'recompose':
+        await acceptRecompose(item.index)
+        break
+      case 'edit':
+        if (item.pending) await acceptPendingEdit(item.index)
+        else await acceptDeclaredEdit(item.edit)
+        break
+      default:
+        await acceptStructure(key)
+        break
+    }
     setBusy('')
   }
 
   async function reject(item: ReviewItem): Promise<void> {
     const key = reviewKey(item)
     setBusy(key)
-    if (item.kind === 'recompose') {
-      rejectRecompose(item.index)
-      notify('info', '已拒绝这项重组，原文保持不变。')
-    } else if (item.pending) {
-      dismissPendingEdit(item.index)
-      notify('info', '已拒绝这项改动，原文保持不变。')
-    } else {
-      await rejectDeclaredEdit(item.edit)
+    switch (item.kind) {
+      case 'recompose':
+        rejectRecompose(item.index)
+        notify('info', '已拒绝这项重组，原文保持不变。')
+        break
+      case 'edit':
+        if (item.pending) {
+          dismissPendingEdit(item.index)
+          notify('info', '已拒绝这项改动，原文保持不变。')
+        } else {
+          await rejectDeclaredEdit(item.edit)
+        }
+        break
+      default:
+        revertStructure(item)
+        break
     }
     setBusy('')
   }
@@ -277,6 +368,15 @@ function ReviewList() {
 
   return (
     <div className="h-full space-y-2 overflow-auto pr-1">
+      <div className="flex flex-wrap items-center gap-1.5 rounded-xl bg-surface-secondary px-3 py-1.5 text-[11px] text-muted">
+        <span>共 {items.length} 项</span>
+        <span>·</span>
+        <span>结构 {structure.length}</span>
+        <span>·</span>
+        <span>重组 {recompose.length}</span>
+        <span>·</span>
+        <span>文字 {pending.length + declared.length}</span>
+      </div>
       {gov.lastHandled && (
         <div className="flex items-center gap-2 rounded-xl bg-surface-secondary px-3 py-2 text-xs text-muted">
           <span className="min-w-0 flex-1">{resultText(gov.lastHandled)}</span>
@@ -297,6 +397,17 @@ function ReviewList() {
               key={key}
               rec={item.rec}
               provisional={item.provisional}
+              busy={busy === key}
+              onAccept={() => void accept(item)}
+              onReject={() => void reject(item)}
+            />
+          )
+        }
+        if (item.kind !== 'edit') {
+          return (
+            <StructureCard
+              key={key}
+              item={item}
               busy={busy === key}
               onAccept={() => void accept(item)}
               onReject={() => void reject(item)}
@@ -354,10 +465,350 @@ function ReviewList() {
 
 /** 校对项在本次渲染里的稳定键；同一条目的按钮 spinner 也用它。 */
 function reviewKey(item: ReviewItem): string {
-  if (item.kind === 'recompose') {
-    return `${item.provisional ? 'sr' : 'r'}-${item.rec.node_id}-${item.index}`
+  switch (item.kind) {
+    case 'recompose':
+      return `${item.provisional ? 'sr' : 'r'}-${item.rec.node_id}-${item.index}`
+    case 'edit':
+      return `${item.provisional ? 'se' : item.pending ? 'pe' : 'de'}-${editSignature(item.edit)}-${item.index}`
+    case 'move':
+      return `mv-${item.move.node_id}-${item.move.kind}-${item.move.from_id}-${item.move.to_id}`
+    case 'section':
+      return `sc-${item.change.kind}-${item.change.id}-${item.change.title}`
+    case 'section-move':
+      return `sm-${item.move.id}-${item.move.baseline_pos}-${item.move.rendered_pos}`
+    case 'element':
+      return `el-${item.binding.kind}-${item.binding.role}-${item.binding.node_id}`
+    case 'meta':
+      return `me-${item.change.field}-${item.change.value}`
+    case 'body-order':
+      return `bo-${item.order.kind}-${item.order.section_id ?? ''}`
   }
-  return `${item.provisional ? 'se' : item.pending ? 'pe' : 'de'}-${editSignature(item.edit)}-${item.index}`
+}
+
+/** 结构变动的中文标签；未知值回显原值，界面不出现裸英文。 */
+const MOVE_LABEL: Record<string, string> = {
+  moved: '换了章节',
+  to_preamble: '移入正文前言',
+  from_preamble: '从前言移入章节',
+  to_element: '改作公文要素',
+}
+
+const SECTION_LABEL: Record<string, string> = {
+  added: '新增章节',
+  missing: '原文有、方案没有',
+  retitled: '标题被改写',
+  releveled: '层级被调整',
+  reparented: '换了上级章节',
+  synthesized: '模型自拟标题',
+}
+
+/**
+ * 一条结构调整的卡片。
+ *
+ * 与文字改动同样给出「原文 → 成品」，但动作的语义不同：同意只是确认这个结构
+ * （方案里本来就是它），不同意则把这段/这章按原文还原。不能把两者混成一个
+ * 沉默的勾选，否则用户无法判断自己到底改变了什么。
+ */
+function StructureCard({
+  item,
+  busy,
+  onAccept,
+  onReject,
+}: {
+  item: Exclude<ReviewItem, { kind: 'edit' } | { kind: 'recompose' }>
+  busy: boolean
+  onAccept: () => void
+  onReject: () => void
+}) {
+  const { tag, detail, undo, canUndo } = structureText(item)
+  return (
+    <div className="space-y-2 rounded-2xl border border-border bg-surface p-3">
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <Badge color="accent">{tag}</Badge>
+        {detail.id ? <span className="font-mono text-muted">{detail.id}</span> : null}
+      </div>
+      {detail.before !== null ? (
+        <div className="space-y-1 text-sm leading-relaxed">
+          <div className="whitespace-pre-wrap text-danger line-through">{detail.before}</div>
+          <div className="whitespace-pre-wrap text-success">{detail.after}</div>
+        </div>
+      ) : (
+        <div className="whitespace-pre-wrap text-sm leading-relaxed">{detail.after}</div>
+      )}
+      {detail.hint ? <div className="text-xs text-muted">{detail.hint}</div> : null}
+      <div className="text-xs text-muted">{undo}</div>
+      {!item.provisional && (
+        <Row className="justify-end">
+          <Button
+            size="sm"
+            variant="danger-soft"
+            isDisabled={busy || !canUndo}
+            onPress={onReject}
+          >
+            不同意
+          </Button>
+          <Button size="sm" variant="primary" isDisabled={busy} onPress={onAccept}>
+            {busy && <InlineSpinner className="size-3" />}
+            同意
+          </Button>
+        </Row>
+      )}
+    </div>
+  )
+}
+
+/** 一条结构调整的展示文案与「不同意」的后果。 */
+function structureText(item: Exclude<ReviewItem, { kind: 'edit' } | { kind: 'recompose' }>): {
+  tag: string
+  detail: { id: string; before: string | null; after: string; hint?: string }
+  undo: string
+  canUndo: boolean
+} {
+  switch (item.kind) {
+    case 'move': {
+      const m = item.move
+      // A grouped entry stands for a whole destination chapter in a source
+      // that had no chapters at all; there is no single paragraph to put
+      // back, so it must not offer a restore it cannot perform.
+      const grouped = m.count !== undefined && m.count > 0
+      return {
+        tag: `段落 · ${MOVE_LABEL[m.kind] ?? m.kind}`,
+        detail: {
+          id: m.node_id,
+          before: m.from,
+          after: m.to,
+          hint: grouped
+            ? `原文没有分章，这一章收进了 ${m.count} 段原文。`
+            : m.text,
+        },
+        undo: grouped
+          ? '原文本来没有章节，无法逐段还原；如不同意，请在「结构方案」里手动调整。'
+          : m.kind === 'to_element'
+            ? '不同意：解除要素绑定，这段回到正文。'
+            : `不同意：按原文顺序把这段放回「${m.from}」。`,
+        canUndo: !grouped,
+      }
+    }
+    case 'section': {
+      const c = item.change
+      const retitle = c.kind === 'retitled'
+      const level = c.kind === 'releveled'
+      const reparent = c.kind === 'reparented'
+      // A releveled card may also carry a parent change: one structural act
+      // can move a chapter both deeper and under a different chapter. Show
+      // both facts, and undo both together, or the restored tree would keep
+      // a parent that no longer matches the restored level.
+      const parentAlsoMoved =
+        level &&
+        (c.baseline_parent_heading_node_id ?? '') !== (c.parent_heading_node_id ?? '')
+      const before = retitle
+        ? (c.baseline_title ?? '')
+        : level
+          ? shapeLabel(c.baseline_level, c.baseline_parent, parentAlsoMoved)
+          : reparent
+            ? (c.baseline_parent ?? '顶层')
+            : null
+      const after = retitle
+        ? c.title
+        : level
+          ? shapeLabel(c.level, c.parent, parentAlsoMoved)
+          : reparent
+            ? (c.parent ?? '顶层')
+            : c.title
+      return {
+        tag: SECTION_LABEL[c.kind] ?? c.kind,
+        detail: {
+          id: c.id,
+          before,
+          after,
+          hint:
+            c.kind === 'missing'
+              ? '原文有这一章，模型（或当前方案）没有保留它。'
+              : c.kind === 'synthesized'
+                ? '这个标题不是原文里的话，是模型新写的。'
+                : c.kind === 'added'
+                  ? '这一章的标题段落原文本来存在，但原文自身没有把它当作章节起点。'
+                  : reparent
+                    ? `「${c.title}」换到了上一级，章内文字没变。`
+                    : parentAlsoMoved
+                      ? `「${c.title}」的层级和上级同时变了，章内文字没变。`
+                      : undefined,
+        },
+        undo:
+          retitle
+            ? `不同意：把标题改回「${c.baseline_title ?? ''}」。`
+            : level
+              ? parentAlsoMoved
+                ? `不同意：把层级和上级一起改回${levelLabel(c.baseline_level)}、挂回「${c.baseline_parent ?? '顶层'}」。`
+                : `不同意：把层级改回${levelLabel(c.baseline_level)}。`
+              : reparent
+                ? `不同意：把这一章挂回「${c.baseline_parent ?? '顶层'}」。`
+                : c.kind === 'missing'
+                  ? '不同意：恢复这一章，并按原文顺序收回它的正文。'
+                  : c.kind === 'synthesized' || c.kind === 'added'
+                    ? '不同意：取消这一章，正文并入相邻章节。'
+                    : '不同意：需要手动调整。',
+        canUndo:
+          retitle || level
+            ? true
+            : reparent
+              ? true
+              : c.kind === 'missing'
+                ? (c.heading_node_id ?? '') !== ''
+                : c.kind === 'synthesized' || c.kind === 'added',
+      }
+    }
+    case 'section-move': {
+      const s = item.move
+      return {
+        tag: '章节换了位置',
+        detail: {
+          id: s.id,
+          before: `原文第 ${s.baseline_pos} 章`,
+          after: `成品第 ${s.rendered_pos} 章`,
+          hint: s.title,
+        },
+        undo: '不同意：整章按原文顺序排回原位置。',
+        canUndo: true,
+      }
+    }
+    case 'element': {
+      const e = item.binding
+      if (e.kind === 'unbound') {
+        return {
+          tag: `段落 · 不再是${roleLabel(e.role)}`,
+          detail: {
+            id: e.node_id,
+            before: `公文要素：${roleLabel(e.role)}`,
+            after: '普通正文',
+            hint: e.text,
+          },
+          undo: `不同意：把这段重新绑定为${roleLabel(e.role)}。`,
+          canUndo: true,
+        }
+      }
+      return {
+        tag: `段落 · 改作${roleLabel(e.role)}`,
+        detail: { id: e.node_id, before: '正文', after: `公文要素：${roleLabel(e.role)}`, hint: e.text },
+        undo: '不同意：解除要素绑定，这段回到正文。',
+        canUndo: true,
+      }
+    }
+    case 'meta':
+      return {
+        tag: `模型自拟${item.change.label}`,
+        detail: {
+          id: '',
+          before: null,
+          after: item.change.value,
+          hint: '原文没有这段文字，是模型按公文体例补的。',
+        },
+        undo: `不同意：清空模型写的${item.change.label}，成品里不再出现。`,
+        canUndo: true,
+      }
+    case 'body-order':
+      return {
+        tag: item.order.kind === 'preamble' ? '前言段序被调整' : '章节内段序被调整',
+        detail: {
+          id: item.order.section_id ?? '',
+          before: '原文顺序',
+          after: '成品顺序不同',
+          hint: item.order.title,
+        },
+        undo: item.order.has_parts
+          ? '这一节含整段重组，段序由重组决定；要还原请先处理对应的重组项。'
+          : '不同意：按原文顺序把这一节（或前言）重新排回。',
+        canUndo: !item.order.has_parts,
+      }
+  }
+}
+
+/** 公文要素的中文名；与后端 roleNames 一致。 */
+function roleLabel(role: string): string {
+  const map: Record<string, string> = {
+    copy_number: '份号',
+    security: '密级',
+    urgency: '紧急程度',
+    masthead: '发文机关标志',
+    doc_number: '发文字号',
+    signatory: '签发人',
+    title: '标题',
+    recipient: '主送机关',
+    attachment_note: '附件说明',
+    signature: '发文机关署名',
+    date: '成文日期',
+    note: '附注',
+    cc: '抄送机关',
+    printer: '印发机关',
+  }
+  return map[role] ?? role
+}
+
+/** 「层级 + 上级」的展示文案；上级没有一起变时只显示层级。 */
+function shapeLabel(level: number | undefined, parent: string | undefined, withParent: boolean): string {
+  const lv = levelLabel(level)
+  return withParent ? `${lv}，上级「${parent ?? '顶层'}」` : lv
+}
+
+/** 「不同意」一条结构调整：按类型还原到原文。 */
+function revertStructure(
+  item: Exclude<ReviewItem, { kind: 'edit' } | { kind: 'recompose' }>,
+): void {
+  switch (item.kind) {
+    case 'move':
+      if ((item.move.count ?? 0) > 0) break
+      if (item.move.kind === 'to_element') restoreElementToBody(item.move.node_id)
+      else restoreMoveTarget(item.move.node_id, item.move.from_id)
+      break
+    case 'section':
+      if (item.change.kind === 'retitled') {
+        restoreSectionTitle(item.change.id, item.change.baseline_title ?? '')
+      } else if (item.change.kind === 'releveled') {
+        if (
+          (item.change.baseline_parent_heading_node_id ?? '') !==
+          (item.change.parent_heading_node_id ?? '')
+        ) {
+          restoreSectionShape(
+            item.change.id,
+            item.change.baseline_level ?? 1,
+            item.change.baseline_parent_heading_node_id ?? '',
+          )
+        } else {
+          restoreSectionLevel(item.change.id, item.change.baseline_level ?? 1)
+        }
+      } else if (item.change.kind === 'reparented') {
+        restoreSectionParent(
+          item.change.id,
+          item.change.baseline_parent_heading_node_id ?? '',
+        )
+      } else if (item.change.kind === 'missing') {
+        restoreMissingSection(item.change)
+      } else {
+        const done =
+          (item.change.heading_node_id ?? '') !== ''
+            ? revertAddedSectionToBody(item.change.id)
+            : dissolveSynthesizedSection(item.change.id)
+        if (!done) return
+      }
+      break
+    case 'section-move':
+      restoreSectionOrder(item.move.id)
+      break
+    case 'element':
+      if (item.binding.kind === 'unbound') {
+        restoreElementBinding(item.binding.node_id, item.binding.role)
+      } else {
+        restoreElementToBody(item.binding.node_id)
+      }
+      break
+    case 'meta':
+      restoreMetaField(item.change.field as keyof Meta, item.change.label)
+      break
+    case 'body-order':
+      if (item.order.kind === 'preamble') restorePreambleOrder()
+      else restoreBodyOrder(item.order.section_id ?? '')
+      break
+  }
 }
 
 /**

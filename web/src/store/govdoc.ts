@@ -14,10 +14,12 @@ import { ApiError, api, describeError, triggerDownload } from '../api/client'
 import {
   diffClean,
   reportOK,
+  ROLE_LABEL,
   type ConfigResponse,
   type Direction,
   type DocumentResponse,
   type Edit,
+  type ElementBinding,
   type Health,
   type Plan,
   type PartialEvent,
@@ -34,7 +36,23 @@ import {
   type StructureDiff,
   type UploadResponse,
 } from '../api/types'
-import { clonePlan } from '../lib/tree'
+import {
+  attachElement,
+  attachPreamble,
+  clearMeta,
+  clonePlan,
+  dissolveSection,
+  placeBodyNodeInSourceOrder,
+  reparentSection,
+  revertAddedSection,
+  restoreSectionFromHeading,
+  sectionForSourceOrder,
+  setSectionLevel,
+  setSectionTitle,
+  sortSectionsBySourceOrder,
+  sortBodyBySourceOrder,
+  type SourceNodeRef,
+} from '../lib/tree'
 import { addEdit, removeEditAt } from '../lib/edits'
 import {
   applyRecompose,
@@ -114,6 +132,13 @@ interface State {
   chatting: boolean
   /** 校对项已被用户处理过的签名；处理过的项不再显示。 */
   handledEdits: string[]
+  /**
+   * 已确认/已还原的结构调整签名。
+   *
+   * 结构差异是服务端每次校验按当前方案重算的，没有「已确认」字段；这里只记
+   * 住本次会话里用户已经处理过的那几条，避免「点了同意它又跳回来」。
+   */
+  handledStructure: string[]
   /** 对话新建、尚未写入方案的待审改动。 */
   pendingEdits: Edit[]
   /** 模型提出、尚未写入方案的整段重组。 */
@@ -181,6 +206,7 @@ const state = reactive<State>({
   chat: [],
   chatting: false,
   handledEdits: [],
+  handledStructure: [],
   pendingEdits: [],
   pendingRecompose: [],
   lastHandled: null,
@@ -472,6 +498,7 @@ export async function uploadDocument(file: File, profileId?: string): Promise<bo
     state.source = null
     state.chat = []
     state.handledEdits = []
+    state.handledStructure = []
     state.pendingEdits = []
     state.pendingRecompose = []
     state.chatting = false
@@ -657,6 +684,316 @@ export function markHandledEdit(edit: Edit): void {
   if (!state.handledEdits.includes(key)) {
     state.handledEdits = [...state.handledEdits, key]
   }
+}
+
+// ---------------------------------------------------------------- 结构调整
+
+/** 记住一条结构调整已处理（本次会话内不再显示）。 */
+export function markHandledStructure(signature: string): void {
+  if (signature === '') return
+  if (!state.handledStructure.includes(signature)) {
+    state.handledStructure = [...state.handledStructure, signature]
+  }
+}
+
+/** 接受一条结构调整：方案里已经是这个形状，只需确认并重新校验。 */
+export async function acceptStructure(signature: string): Promise<boolean> {
+  markHandledStructure(signature)
+  return verifyPlanNow()
+}
+
+/** 原文的节点顺序表（还原结构时按它插回原位）。 */
+function sourceOrder(): Map<string, number> {
+  const map = new Map<string, number>()
+  for (const n of state.source?.doc.nodes ?? state.upload?.nodes ?? []) {
+    map.set(n.id, n.order)
+  }
+  return map
+}
+
+/** 原文节点清单，供「恢复被并掉的章节」判断章节范围。 */
+function sourceRefs(): SourceNodeRef[] {
+  return (state.source?.doc.nodes ?? state.upload?.nodes ?? []).map((n) => ({
+    id: n.id,
+    kind: n.kind,
+    level: n.level,
+    order: n.order,
+  }))
+}
+
+/**
+ * 把一段原文放回原文结构里它应在的位置。
+ *
+ * 用于「不同意换章节」：原文前面最近的标题决定归属；在第一个标题之前则
+ * 回到正文前言。这和服务端 baseline.Build 的规则一致，所以还原后再校验，
+ * 结构差异里这一条就会消失。
+ */
+export function restoreNodeToSource(nodeId: string): boolean {
+  if (!state.plan) return false
+  const order = sourceOrder()
+  if (!order.has(nodeId)) return false
+  const target = sectionForSourceOrder(state.plan, nodeId, order)
+  editPlan((plan) =>
+    target
+      ? placeBodyNodeInSourceOrder(plan, target.id, nodeId, order)
+      : attachPreamble(plan, nodeId, order),
+  )
+  notify(
+    'info',
+    target
+      ? `已把这段按原文顺序放回「${target.title || target.id}」。正在重新校验。`
+      : '已把这段按原文顺序放回正文前言。正在重新校验。',
+  )
+  return true
+}
+
+/** 把一段原文移回它原来所属的章节（结构差异里记录了起点 id）。 */
+export function restoreMoveTarget(nodeId: string, fromId: string): boolean {
+  if (!state.plan) return false
+  const order = sourceOrder()
+  if (!order.has(nodeId)) return false
+  if (fromId === '') {
+    editPlan((plan) => attachPreamble(plan, nodeId, order))
+    notify('info', '已把这段移回正文前言。正在重新校验。')
+    return true
+  }
+  const exists = (state.plan.sections ?? []).length > 0 && findSectionIn(state.plan, fromId)
+  if (!exists) return restoreNodeToSource(nodeId)
+  editPlan((plan) => placeBodyNodeInSourceOrder(plan, fromId, nodeId, order))
+  notify('info', '已按原文顺序把这段移回原章节。正在重新校验。')
+  return true
+}
+
+function findSectionIn(plan: Plan, id: string): boolean {
+  let found = false
+  const walk = (list: typeof plan.sections): void => {
+    for (const s of list) {
+      if (s.id === id) found = true
+      walk(s.children ?? [])
+    }
+  }
+  walk(plan.sections)
+  return found
+}
+
+/** 还原被改写的章节标题。 */
+export function restoreSectionTitle(sectionId: string, title: string): boolean {
+  if (title.trim() === '') return false
+  editPlan((plan) => ({ ...plan, sections: setSectionTitle(plan.sections, sectionId, title) }))
+  notify('info', `已把章节标题改回原文「${title}」。正在重新校验。`)
+  return true
+}
+
+/** 还原被调整的章节层级。 */
+export function restoreSectionLevel(sectionId: string, level: number): boolean {
+  let ok = false
+  editPlan((plan) => {
+    const sections = setSectionLevel(plan.sections, sectionId, level)
+    if (!sections) return plan
+    ok = true
+    return { ...plan, sections }
+  })
+  if (!ok) {
+    notify('error', '这个章节的子章节比它更深，无法直接改回原层级；请先调整子章节。')
+    return false
+  }
+  notify('info', '已把章节层级改回原文。正在重新校验。')
+  return true
+}
+
+/**
+ * 章节换了上级：把它挂回原文里的父章节（顶层则还没挂回）。
+ *
+ * 只挪树上的位置，不改标题、层级与正文 —— 这正是「子章被摊平成一级章」
+ * 时需要的还原动作。
+ */
+export function restoreSectionParent(
+  sectionId: string,
+  baselineParentHeadingId: string,
+): boolean {
+  const order = sourceOrder()
+  let ok = false
+  editPlan((plan) => {
+    const next = reparentSection(plan.sections, sectionId, baselineParentHeadingId, order)
+    if (!next) return plan
+    ok = true
+    return { ...plan, sections: next }
+  })
+  if (!ok) {
+    notify('error', '找不到原文里的上级章节（它可能已被删除），无法自动挂回；请手动调整。')
+    return false
+  }
+  notify('info', '已把这一章挂回原文的上级章节。正在重新校验。')
+  return true
+}
+
+/**
+ * 章节的层级和上级同时被改：一次把两件事都还原。
+ *
+ * 只改层级会在错误的父级下得到自相矛盾的树（父级比它浅、子级比它深都
+ * 可能不成立），所以两步必须同时成功，任一步失败就整体不动。
+ */
+export function restoreSectionShape(
+  sectionId: string,
+  level: number,
+  baselineParentHeadingId: string,
+): boolean {
+  const order = sourceOrder()
+  let ok = false
+  editPlan((plan) => {
+    const moved = reparentSection(plan.sections, sectionId, baselineParentHeadingId, order)
+    if (!moved) return plan
+    const shaped = setSectionLevel(moved, sectionId, level)
+    if (!shaped) return plan
+    ok = true
+    return { ...plan, sections: shaped }
+  })
+  if (!ok) {
+    notify(
+      'error',
+      '无法同时还原这一章的层级和上级（目标层级与相邻章节冲突）；请先调整子章节。',
+    )
+    return false
+  }
+  notify('info', '已把这一章的层级和上级一起改回原文。正在重新校验。')
+  return true
+}
+
+/** 章节位置被调整：整章按原文顺序排回它应在的位置。 */
+export function restoreSectionOrder(sectionId: string): boolean {
+  const order = sourceOrder()
+  let ok = false
+  editPlan((plan) => {
+    if (!findSectionIn(plan, sectionId)) return plan
+    ok = true
+    return { ...plan, sections: sortSectionsBySourceOrder(plan.sections, order) }
+  })
+  if (!ok) return false
+  notify('info', '已按原文顺序排回章节位置。正在重新校验。')
+  return true
+}
+
+/** 章节内正文顺序被调整：按原文顺序排回本节内容。 */
+export function restoreBodyOrder(sectionId: string): boolean {
+  const order = sourceOrder()
+  editPlan((plan) => ({ ...plan, sections: sortBodyBySourceOrder(plan.sections, sectionId, order) }))
+  notify('info', '已把这一章的正文顺序改回原文。正在重新校验。')
+  return true
+}
+
+/** 正文前言内的段序被调整：按原文顺序排回前言。 */
+export function restorePreambleOrder(): boolean {
+  const order = sourceOrder()
+  editPlan((plan) => {
+    const ids = [...(plan.preamble_node_ids ?? [])]
+    ids.sort(
+      (a, b) => (order.get(a) ?? Number.MAX_SAFE_INTEGER) - (order.get(b) ?? Number.MAX_SAFE_INTEGER),
+    )
+    return { ...plan, preamble_node_ids: ids }
+  })
+  notify('info', '已把正文前言的段序改回原文。正在重新校验。')
+  return true
+}
+
+/** 原文章节被并掉：按原文标题与范围恢复出这一章。 */
+export function restoreMissingSection(change: {
+  id: string
+  title: string
+  heading_node_id?: string
+  baseline_level?: number
+}): boolean {
+  const headingId = change.heading_node_id ?? ''
+  if (headingId === '') return false
+  const order = sourceOrder()
+  const nodes = sourceRefs()
+  editPlan((plan) =>
+    restoreSectionFromHeading(plan, headingId, change.title, change.baseline_level ?? 0, nodes, order),
+  )
+  notify('info', `已恢复章节「${change.title}」，并按原文顺序收回了它的正文。正在重新校验。`)
+  return true
+}
+
+/**
+ * 模型新增的章节（标题是模型写的）：不同意就拆掉标题。
+ *
+ * 正文不会丢：并入父章节或相邻章节。含原文标题的章节不走这里 —— 那不是
+ * 「新增」，删掉会把作者写的标题也一起删掉。
+ */
+export function dissolveSynthesizedSection(sectionId: string): boolean {
+  const order = sourceOrder()
+  let ok = false
+  editPlan((plan) => {
+    const next = dissolveSection(plan, sectionId, order)
+    if (!next) return plan
+    ok = true
+    return { ...next, sections: sortSectionsBySourceOrder(next.sections, order) }
+  })
+  if (!ok) {
+    notify('error', '这个章节带有原文标题，不能按「新增章节」删除；请改用「不同意标题改写」或手动调整。')
+    return false
+  }
+  notify('info', '已去掉模型新增的章节标题，正文并入了相邻章节。正在重新校验。')
+  return true
+}
+
+/** 原文标题被模型「新开」成一章：不同意就并回相邻章节，标题文字保留。 */
+export function revertAddedSectionToBody(sectionId: string): boolean {
+  const order = sourceOrder()
+  let ok = false
+  editPlan((plan) => {
+    const next = revertAddedSection(plan, sectionId, order)
+    if (!next) return plan
+    ok = true
+    return { ...next, sections: sortSectionsBySourceOrder(next.sections, order) }
+  })
+  if (!ok) {
+    notify('error', '这一章的重组分片无处安放，无法自动并回；请手动调整。')
+    return false
+  }
+  notify('info', '已取消这个新增章节，标题与正文都并回相邻章节。正在重新校验。')
+  return true
+}
+
+/**
+ * 解除一处公文要素绑定，并按原文顺序把它放回正文。
+ *
+ * 只解绑会把这段变成「未被任何章节收录」—— 校验立刻报漏收，用户还得再手动
+ * 收一次。放回原文所属章节才是一次完整的「不同意」。
+ */
+export function restoreElementToBody(nodeId: string): boolean {
+  if (!state.plan) return false
+  const order = sourceOrder()
+  if (!order.has(nodeId)) return false
+  const target = sectionForSourceOrder(state.plan, nodeId, order)
+  editPlan((plan) =>
+    target
+      ? placeBodyNodeInSourceOrder(plan, target.id, nodeId, order)
+      : attachPreamble(plan, nodeId, order),
+  )
+  notify(
+    'info',
+    target
+      ? `已解除要素绑定，并把这句放回「${target.title || target.id}」。正在重新校验。`
+      : '已解除要素绑定，并把这句放回正文前言。正在重新校验。',
+  )
+  return true
+}
+
+/** 重新绑定一个被取消的公文要素（例如原文标题又被当成了普通正文）。 */
+export function restoreElementBinding(nodeId: string, role: string): boolean {
+  if (!state.plan || nodeId === '' || role === '') return false
+  editPlan((plan) => attachElement(plan, nodeId, role as ElementBinding['role']))
+  const label = ROLE_LABEL[role as ElementBinding['role']] ?? role
+  notify('info', `已把这段重新绑定为${label}。正在重新校验。`)
+  return true
+}
+
+/** 清空模型自拟的公文要素（原文没有对应段落）。 */
+export function restoreMetaField(field: keyof Plan['meta'], label: string): boolean {
+  if (!state.plan) return false
+  editPlan((plan) => clearMeta(plan, field))
+  notify('info', `已清空模型自拟的${label}。正在重新校验。`)
+  return true
 }
 
 /** 改动签名（与 lib/edits.ts 的 editKey 对齐）。 */
@@ -903,6 +1240,7 @@ export function applyPlanResult(
   state.report = normalizeReport(report)
   state.structure = structure ?? null
   state.handledEdits = []
+  state.handledStructure = []
   state.pendingEdits = incoming
   state.pendingRecompose = split.pending
   state.lastHandled = null
@@ -1097,6 +1435,7 @@ export function replacePlan(plan: Plan, report: Report | null): void {
   state.plan = normalizePlan(plan)
   state.report = normalizeReport(report)
   state.handledEdits = []
+  state.handledStructure = []
   state.pendingEdits = []
   state.pendingRecompose = []
   state.partialPlan = null
@@ -1130,6 +1469,7 @@ export function resetDocument(): void {
   state.chat = []
   state.chatting = false
   state.handledEdits = []
+  state.handledStructure = []
   state.pendingEdits = []
   state.pendingRecompose = []
   state.partialPlan = null

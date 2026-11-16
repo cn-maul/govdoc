@@ -971,15 +971,36 @@ export interface StructureMove {
   from_id: string
   to: string
   to_id: string
+  /**
+   * 汇总条目的段落数。
+   *
+   * 原文完全没有分章时，各段归入哪一章不是原文能回答的问题；界面按目标
+   * 章节汇总成一条（此时 node_id 为空），避免几十张一模一样的卡片。
+   */
+  count?: number
 }
 
 /** 一个章节相对原文结构的增删改名。 */
 export interface SectionChange {
-  /** added | missing | retitled */
+  /** added | missing | retitled | releveled | reparented | synthesized */
   kind: string
   id: string
   title: string
   baseline_title?: string
+  /** 该章对应的原文标题节点；用于「恢复这一章」。 */
+  heading_node_id?: string
+  /** 方案里的层级。 */
+  level?: number
+  /** 原文里的层级。 */
+  baseline_level?: number
+  /** 方案里的父章节名称（顶层为空时显示「顶层」）。 */
+  parent?: string
+  /** 原文里的父章节名称。 */
+  baseline_parent?: string
+  /** 方案里父章节的原文标题节点，用于一键挂回。 */
+  parent_heading_node_id?: string
+  /** 原文里父章节的标题节点。 */
+  baseline_parent_heading_node_id?: string
 }
 
 /** 一个章节在阅读顺序中的位置变化（1-based）。 */
@@ -1001,6 +1022,49 @@ export interface StructureDiff {
   moves: StructureMove[]
   sections: SectionChange[]
   moved_sections: SectionMove[]
+  /** 方案把某段绑定成公文要素（标题/主送机关/成文日期…），而原文结构里没有。 */
+  elements?: ElementChange[]
+  /** 模型自己写的公文要素值，原文没有对应段落。 */
+  meta?: MetaChange[]
+  /** 章节内（或正文前言内）正文顺序与原文不一致。 */
+  body_orders?: BodyOrder[]
+  /**
+   * 原文自身没有任何章节结构（基线只有一个不分章的桶）。
+   *
+   * 此时模型分章会让每一段都「换了章节」，那正是要达成的结果，不应逐段弹卡；
+   * 界面把这类移动按目标章节汇总成一条。
+   */
+  baseline_flat?: boolean
+}
+
+/** 一处要素绑定：某段原文被放到版头/版记的槽位。 */
+export interface ElementChange {
+  /**
+   * bound = 新增绑定（这段原文被放进了版头/版记）；
+   * unbound = 原文有的绑定被取消（例如标题被当成普通正文）。
+   */
+  kind: string
+  role: string
+  node_id: string
+  text: string
+}
+
+/** 一处模型自拟的公文要素（原文没有对应段落）。 */
+export interface MetaChange {
+  field: string
+  label: string
+  value: string
+}
+
+/** 一节正文（或前言）的段序与原文不一致。 */
+export interface BodyOrder {
+  /** section | preamble */
+  kind: string
+  section_id?: string
+  title: string
+  node_ids: string[]
+  /** 本节还含重组分片，无法只靠排序正文 id 还原。 */
+  has_parts?: boolean
 }
 
 export interface PlanResponse {

@@ -129,7 +129,15 @@ func Build(doc *docmodel.Document) *docmodel.Plan {
 
 		// Close every section at this level or deeper: a second "（一）"
 		// follows the first rather than nesting inside it.
-		for len(stack) > 0 && stack[len(stack)-1].s.Level >= lvl {
+		//
+		// The comparison uses the level the *source* declared, not the one the
+		// tree ended up storing. A skipped level is pulled up so the tree is
+		// expressible (一、 straight to 1. stores 1. as level 2); the next
+		// heading at the same source level must then close it rather than
+		// nest under it. Using the stored level here turned "1./2." siblings
+		// into a parent/child pair, which in turn made the structural diff
+		// report a relocation the author never made.
+		for len(stack) > 0 && stack[len(stack)-1].srcLevel >= lvl {
 			stack = stack[:len(stack)-1]
 		}
 		// A heading nested under the current stack must be exactly one
@@ -150,7 +158,7 @@ func Build(doc *docmodel.Document) *docmodel.Plan {
 			Level:         lvl,
 			HeadingNodeID: n.ID,
 			BodyNodeIDs:   []string{},
-		}}
+		}, srcLevel: cutLevel[n.ID]}
 		if len(stack) > 0 {
 			parent := stack[len(stack)-1]
 			parent.kids = append(parent.kids, n2)
@@ -169,8 +177,9 @@ func Build(doc *docmodel.Document) *docmodel.Plan {
 // node is one section under construction, with its children kept as pointers
 // so a subtree can be completed before it is copied out.
 type node struct {
-	s    *docmodel.Section
-	kids []*node
+	s        *docmodel.Section
+	srcLevel int
+	kids     []*node
 }
 
 // materialize converts the pointer tree into the value tree the plan carries,

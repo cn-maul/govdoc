@@ -274,9 +274,33 @@ data: {"plan":{...},"report":{...},"structure":{...}}
 
 `structure` 是**结构变动清单**：方案相对「原文自身结构」的差异，由服务端每次校验时
 重新推导（基线不依赖模型，因此永远可用）。字段为
-`{moves:[{node_id,text,kind,from,from_id,to,to_id}], sections:[{kind,id,title,baseline_title?}], moved_sections:[{id,title,baseline_pos,rendered_pos}]}`，
-三者恒为数组（无差异时为空数组，不是 `null`）。`report` 只回答「有没有丢、有没有重复」，
-`structure` 回答「哪一段换了章节、哪个章节增删改名或换了位置」——两者互补。
+
+```jsonc
+{
+  "moves": [{"node_id","text","kind","from","from_id","to","to_id","count"}],
+  "sections": [{
+    "kind",              // added | missing | retitled | releveled | reparented | synthesized
+    "id","title","baseline_title",
+    "heading_node_id",   // 该章对应的原文标题节点（恢复这一章用）
+    "level","baseline_level",
+    "parent","baseline_parent",
+    "parent_heading_node_id","baseline_parent_heading_node_id"
+  }],
+  "moved_sections": [{"id","title","baseline_pos","rendered_pos"}],
+  "elements": [{"kind","role","node_id","text"}],   // kind: bound | unbound
+  "meta": [{"field","label","value"}],              // 模型自拟、原文无对应段落
+  "body_orders": [{"kind","section_id","title","node_ids","has_parts"}], // kind: section | preamble
+  "baseline_flat": false                            // 原文自身无章节结构（单一不分章的桶）
+}
+```
+
+各数组恒存在（无差异时为空数组，不是 `null`）。`report` 只回答「有没有丢、有没有重复」，
+`structure` 回答「哪一段换了章节、哪个章节增删改名/改层级/换上级/换位置、哪段被绑成或
+取消公文要素、哪个要素是模型自拟的、哪一节段序被调整」——两者互补。
+`baseline_flat` 为真时，原文只有一个不分章的桶，任何一章都是新建的。此时 `moves`
+按目标章节汇总：`node_id` 为空、`text` 为空、`count` 为该章收进的原文段数，
+`from` 为「原文无分章」。界面显示这一条（否则最常见的「一整段没结构」上传会一条
+结构项都没有），但不提供逐段还原；`moved_sections` 在这种情形下不展示。
 
 ## 4. 目录与写权限（互斥，避免冲突）
 

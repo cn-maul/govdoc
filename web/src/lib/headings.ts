@@ -78,3 +78,19 @@ export function outlineFromNodes(nodes: NodeSummary[]): OutlineItem[] {
 export function headingTag(level: number): string {
   return `H${Math.max(1, Math.min(3, level))}`
 }
+
+/** 层次序数的中文说法，用于展示章节层级。 */
+export function levelLabel(level: number | undefined): string {
+  switch (level) {
+    case 1:
+      return '一级（一、）'
+    case 2:
+      return '二级（（一））'
+    case 3:
+      return '三级（1.）'
+    case 4:
+      return '四级（（1））'
+    default:
+      return '未定级'
+  }
+}

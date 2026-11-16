@@ -11,6 +11,14 @@
 
 import type { Plan, Role, Section } from '../api/types'
 
+/** 还原结构时需要的最少原文信息。 */
+export interface SourceNodeRef {
+  id: string
+  kind: string
+  level?: number
+  order: number
+}
+
 /** 深拷贝一棵章节树。 */
 export function cloneSections(sections: Section[]): Section[] {
   return sections.map((s) => ({
@@ -119,6 +127,146 @@ export function detachElement(plan: Plan, nodeId: string): Plan {
   return { ...plan, elements: (plan.elements ?? []).filter((e) => e.node_id !== nodeId) }
 }
 
+/** 把节点绑定回某个公文要素槽位（先清掉它在别处的全部认领，避免重复）。 */
+export function attachElement(plan: Plan, nodeId: string, role: Role): Plan {
+  const cleared = clearNodeClaims(plan, nodeId)
+  const elements = [...(cleared.elements ?? []).filter((e) => e.role !== role)]
+  elements.push({ role, node_id: nodeId })
+  return { ...cleared, elements }
+}
+
+/** 清空一个模型自拟的 meta 值（它没有对应原文，删掉不会丢内容）。 */
+export function clearMeta(plan: Plan, field: keyof Plan['meta']): Plan {
+  return { ...plan, meta: { ...plan.meta, [field]: '' } }
+}
+
+/**
+ * 按原文把一个被并掉的章节恢复出来。
+ *
+ * 恢复的不是一个空壳：以该标题为起点，到下一个同级或更高级标题之前的正文
+ * 都放回这一章（这些段落按原文本来就属于它）。范围内的子章节保持原样，
+ * 只把章节树按原文顺序重新排一次。
+ *
+ * 这是「不同意模型把这一章并掉」的还原动作；它只搬运引用，不改一个字。
+ */
+export function restoreSectionFromHeading(
+  plan: Plan,
+  headingId: string,
+  title: string,
+  level: number,
+  nodes: SourceNodeRef[],
+  order: Map<string, number>,
+): Plan {
+  const headingOrder = order.get(headingId)
+  if (headingOrder === undefined) return plan
+
+  const headingLevel =
+    level > 0 ? level : (nodes.find((n) => n.id === headingId)?.level ?? 1)
+
+  // 下一个同级或更高级标题就是本章的终点。
+  let limit = Number.POSITIVE_INFINITY
+  for (const n of nodes) {
+    if (n.kind !== 'heading') continue
+    const o = order.get(n.id)
+    if (o === undefined || o <= headingOrder) continue
+    const lvl = Math.max(1, n.level ?? 1)
+    if (lvl <= headingLevel && o < limit) limit = o
+  }
+
+  // 范围内的**子标题**也要排除：它们的正文属于子章节，不属于本层。
+  // 只按层级判断，不按标题文字猜，恢复出来的树才和原文的分层一致。
+  const subHeadingOrders: number[] = []
+  for (const n of nodes) {
+    if (n.kind !== 'heading') continue
+    const o = order.get(n.id)
+    if (o === undefined || o <= headingOrder || o >= limit) continue
+    const lvl = Math.max(1, n.level ?? 1)
+    if (lvl > headingLevel) subHeadingOrders.push(o)
+  }
+  const insideSubheading = (o: number): boolean => {
+    let parent = -1
+    for (const s of subHeadingOrders) {
+      if (s < o && s > parent) parent = s
+    }
+    return parent >= 0
+  }
+
+  // 范围内、且没有被别的章节用作标题、也不属于子章节的正文，归回这一章。
+  const headingIDs = new Set<string>()
+  walkSections(plan.sections, (s) => {
+    if (s.heading_node_id) headingIDs.add(s.heading_node_id)
+  })
+  // 已绑定成公文要素、或已被重组占用的节点不能当正文抢回来：前者会从
+  // 版头/版记消失，后者会让重组分片找不到声明。
+  const keepOut = new Set<string>()
+  for (const e of plan.elements ?? []) keepOut.add(e.node_id)
+  for (const r of plan.recompose ?? []) keepOut.add(r.node_id)
+  const body: string[] = []
+  for (const n of nodes) {
+    if (n.id === headingId) continue
+    const o = order.get(n.id)
+    if (o === undefined || o <= headingOrder || o >= limit) continue
+    if (n.kind === 'page_break' || n.kind === 'heading') continue
+    if (headingIDs.has(n.id)) continue
+    if (keepOut.has(n.id)) continue
+    if (insideSubheading(o)) continue
+    body.push(n.id)
+  }
+
+  let next = clearNodeClaims(plan, headingId)
+  for (const id of body) next = clearNodeClaims(next, id)
+
+  const section: Section = {
+    id: nextSectionID(next.sections),
+    title,
+    level: headingLevel,
+    heading_node_id: headingId,
+    body_node_ids: body,
+  }
+  // 正文可能全部落在子章节里，因此 body 为空不代表恢复失败：章节本身与它的
+  // 标题仍然是从原文恢复出来的，子章节会保留各自的正文。
+  const sections = insertSectionInSourceOrder(next.sections, section, order)
+  return { ...next, sections }
+}
+
+/**
+ * 把新章节插到树里，并尽量放回它原本的父章节。
+ *
+ * 父章节 = 位于它之前、层级比它浅、且离它最近的那一章。找不到就放在根级。
+ * 只按层级选父，不按标题猜，避免把一章挂到内容毫不相干的章节下面。
+ */
+function insertSectionInSourceOrder(
+  sections: Section[],
+  section: Section,
+  order: Map<string, number>,
+): Section[] {
+  const anchor = sectionAnchorOrder(section, order)
+  let parent: Section | null = null
+  let parentAnchor = Number.NEGATIVE_INFINITY
+  walkSections(sections, (s) => {
+    if (s.level >= section.level) return
+    const a = sectionAnchorOrder(s, order)
+    if (a < anchor && a > parentAnchor) {
+      parent = s
+      parentAnchor = a
+    }
+  })
+
+  if (!parent) {
+    return sortSectionsBySourceOrder([...sections, section], order)
+  }
+  const parentID = (parent as Section).id
+  const rec = (list: Section[]): Section[] =>
+    list.map((s) => {
+      if (s.id === parentID) {
+        const kids = sortSectionsBySourceOrder([...(s.children ?? []), section], order)
+        return { ...s, children: kids }
+      }
+      return { ...s, children: s.children ? rec(s.children) : undefined }
+    })
+  return sortSectionsBySourceOrder(rec(sections), order)
+}
+
 /** 深度优先前序遍历所有章节（含嵌套），父在子前。 */
 export function walkSections(
   sections: Section[],
@@ -163,6 +311,22 @@ export function findSection(sections: Section[], id: string): Section | null {
   return found
 }
 
+/** 按标题找章节。原文标题与方案标题只在空白上有出入时也视为同一章。 */
+export function findSectionByTitle(sections: Section[], title: string): Section | null {
+  const want = titleKey(title)
+  if (want === '') return null
+  let found: Section | null = null
+  walkSections(sections, (s) => {
+    if (found === null && titleKey(s.title) === want) found = s
+  })
+  return found
+}
+
+/** 标题比较键：忽略首尾与中间空白，避免「一、总体 要求」被当成另一章。 */
+export function titleKey(title: string): string {
+  return (title ?? '').replace(/\s+/g, '')
+}
+
 /** 某个节点当前被哪些章节引用（正文位置）。 */
 export function sectionsContainingNode(sections: Section[], nodeId: string): Section[] {
   const out: Section[] = []
@@ -170,6 +334,294 @@ export function sectionsContainingNode(sections: Section[], nodeId: string): Sec
     if (s.body_node_ids?.includes(nodeId)) out.push(s)
   })
   return out
+}
+
+/**
+ * 章节在原文里的起点。
+ *
+ * 优先用标题节点的原文位置；标题由模型自拟时，退到本节正文的第一段，
+ * 再退到子章节。这个值只用于「按原文顺序放回去」，不改动任何文字。
+ */
+export function sectionAnchorOrder(section: Section, order: Map<string, number>): number {
+  let min = Number.POSITIVE_INFINITY
+  const bump = (id: string | undefined): void => {
+    if (!id) return
+    const o = order.get(id)
+    if (o !== undefined && o < min) min = o
+  }
+  bump(section.heading_node_id)
+  for (const id of section.body_node_ids ?? []) bump(id)
+  for (const bp of section.body_parts ?? []) bump(bp.node_id)
+  if (min === Number.POSITIVE_INFINITY) {
+    for (const child of section.children ?? []) {
+      const o = sectionAnchorOrder(child, order)
+      if (o < min) min = o
+    }
+  }
+  return min
+}
+
+/**
+ * 按原文顺序找出某段应在的章节。
+ *
+ * 基线（baseline.Build）的规则是「前面最近的那个标题」。这里用同样的规则：
+ * 在所有起点早于该节点的章节中，取起点最晚的一章。找不到时返回 null，
+ * 表示它在第一个标题之前，应回到正文前言。
+ */
+export function sectionForSourceOrder(
+  plan: Plan,
+  nodeId: string,
+  order: Map<string, number>,
+): Section | null {
+  const mine = order.get(nodeId)
+  if (mine === undefined) return null
+  let best: Section | null = null
+  let bestOrder = Number.NEGATIVE_INFINITY
+  walkSections(plan.sections, (s) => {
+    const anchor = sectionAnchorOrder(s, order)
+    if (anchor < mine && anchor > bestOrder) {
+      best = s
+      bestOrder = anchor
+    }
+  })
+  return best
+}
+
+/** 递归按原文顺序重排每一层章节；起点相同的保持原有相对次序。 */
+export function sortSectionsBySourceOrder(sections: Section[], order: Map<string, number>): Section[] {
+  const rec = (list: Section[]): Section[] =>
+    list
+      .map((s, index) => ({
+        section: { ...s, children: s.children ? rec(s.children) : undefined },
+        index,
+        anchor: sectionAnchorOrder(s, order),
+      }))
+      .sort((a, b) => {
+        if (a.anchor === b.anchor) return a.index - b.index
+        return a.anchor - b.anchor
+      })
+      .map((x) => x.section)
+  return rec(sections)
+}
+
+/** 把某一章节的正文按原文顺序重排（只改引用顺序，不改文字）。 */
+export function sortBodyBySourceOrder(
+  sections: Section[],
+  sectionId: string,
+  order: Map<string, number>,
+): Section[] {
+  const rec = (list: Section[]): Section[] =>
+    list.map((s) => {
+      const next: Section = { ...s, children: s.children ? rec(s.children) : undefined }
+      if (s.id !== sectionId) return next
+      const body = [...(s.body_node_ids ?? [])]
+      body.sort((a, b) => (order.get(a) ?? Number.MAX_SAFE_INTEGER) - (order.get(b) ?? Number.MAX_SAFE_INTEGER))
+      return { ...next, body_node_ids: body, preserve_order: false }
+    })
+  return rec(sections)
+}
+
+/**
+ * 拆掉一个由模型自拟标题的章节，把它承载的内容并回最近的可承接位置。
+ *
+ * 这是「不同意新增章节」的还原动作：标题是模型写的，删掉不丢原文；正文与
+ * 子章节必须留下，否则会出现「内容突然不见了」。合并目标依次是父章节、前一个
+ * 同级章节；两者都没有时，正文回到正文前言（它本来就排在这些章节之前）。
+ *
+ * 返回 null 表示没有安全的位置可放，调用方应保持原样并说明原因。
+ */
+export function dissolveSection(
+  plan: Plan,
+  sectionId: string,
+  order: Map<string, number>,
+): Plan | null {
+  const found = locateSection(plan.sections, sectionId, null)
+  if (!found) return null
+  const victim = found.list[found.index]
+  if (victim.heading_node_id) return null
+
+  // 先把章节本身拿掉（子章节提升到原位置），再把它的正文并入相邻章节。
+  //
+  // 不按「原文归属」重算：模型新增章节最常见的场景就是原文本来没有标题，
+  // 这时按原文归属算回去只会把它们放进另一个同样新增的章节里，用户看到的是
+  // 「点了不同意，段落却跑到别处」。并入相邻章节是唯一可预期的结果。
+  const sections = removeSectionPromoteChildren(plan.sections, sectionId)
+  let nextPlan: Plan = { ...plan, sections }
+
+  const target = neighbourSection(found)?.id ?? ''
+  const parts = victim.body_parts ?? []
+  if (target === '' && ((victim.body_node_ids ?? []).length > 0 || parts.length > 0)) {
+    // 没有相邻章节可并：只能回到正文前言，正文才不至于消失。
+    for (const id of victim.body_node_ids ?? []) nextPlan = attachPreamble(nextPlan, id, order)
+    for (const bp of parts) {
+      const at = sectionForSourceOrder(nextPlan, bp.node_id, order)
+      if (!at) return null
+      nextPlan = { ...nextPlan, sections: appendBodyParts(nextPlan.sections, at.id, [bp]) }
+    }
+    return nextPlan
+  }
+  for (const id of victim.body_node_ids ?? []) {
+    nextPlan = placeBodyNodeInSourceOrder(nextPlan, target, id, order)
+  }
+  if (parts.length > 0) {
+    nextPlan = { ...nextPlan, sections: appendBodyParts(nextPlan.sections, target, parts) }
+  }
+
+  return nextPlan
+}
+
+/** 章节的前一个同级/父级、后一个同级章节，作为合并目标。 */
+function neighbourSection(found: {
+  list: Section[]
+  index: number
+  parent: Section | null
+}): Section | null {
+  return found.parent ?? found.list[found.index + 1] ?? found.list[found.index - 1] ?? null
+}
+
+/**
+ * 不同意「新增章节」并把它还原成正文。
+ *
+ * 与 dissolveSection 的区别：这里的章节标题来自原文某个段落（模型把一段普通
+ * 文字当成了标题）。只删章节会把那段文字一起弄丢，所以标题段落要作为正文放回
+ * 相邻章节；原文那段文字一个字都不改。
+ */
+export function revertAddedSection(
+  plan: Plan,
+  sectionId: string,
+  order: Map<string, number>,
+): Plan | null {
+  const found = locateSection(plan.sections, sectionId, null)
+  if (!found) return null
+  const victim = found.list[found.index]
+  const ids = [
+    ...(victim.heading_node_id ? [victim.heading_node_id] : []),
+    ...(victim.body_node_ids ?? []),
+  ]
+  const parts = victim.body_parts ?? []
+  const target = neighbourSection(found)
+
+  let next: Plan = { ...plan, sections: removeSectionPromoteChildren(plan.sections, sectionId) }
+  const hasTarget = target !== null && locateSection(next.sections, target.id, null) !== null
+  if (!hasTarget && parts.length > 0) return null
+
+  for (const id of ids) {
+    next = hasTarget && target
+      ? placeBodyNodeInSourceOrder(next, target.id, id, order)
+      : attachPreamble(next, id, order)
+  }
+  if (hasTarget && target && parts.length > 0) {
+    next = { ...next, sections: appendBodyParts(next.sections, target.id, parts) }
+  }
+  return next
+}
+
+/** 找到章节所在的列表、下标与父章节。 */
+function locateSection(
+  list: Section[],
+  id: string,
+  parent: Section | null,
+): { list: Section[]; index: number; parent: Section | null } | null {
+  for (let i = 0; i < list.length; i++) {
+    if (list[i].id === id) return { list, index: i, parent }
+    const child = locateSection(list[i].children ?? [], id, list[i])
+    if (child) return child
+  }
+  return null
+}
+
+/** 移除一个章节，把它的子章节提升到它原来的位置。 */
+function removeSectionPromoteChildren(list: Section[], id: string): Section[] {
+  const out: Section[] = []
+  for (const s of list) {
+    if (s.id === id) {
+      out.push(...(s.children ?? []))
+      continue
+    }
+    out.push({ ...s, children: s.children ? removeSectionPromoteChildren(s.children, id) : undefined })
+  }
+  return out
+}
+
+/** 从树里摘掉一个章节（连同它的子树），返回剩下的树与被摘掉的章节。 */
+function detachSection(
+  list: Section[],
+  id: string,
+): { sections: Section[]; victim: Section | null } {
+  let victim: Section | null = null
+  const rec = (items: Section[]): Section[] => {
+    const out: Section[] = []
+    for (const s of items) {
+      if (s.id === id) {
+        victim = s
+        continue
+      }
+      out.push({ ...s, children: s.children ? rec(s.children) : undefined })
+    }
+    return out
+  }
+  const sections = rec(list)
+  return { sections, victim }
+}
+
+/**
+ * 把一章挂回原文里的父章节（或顶层）。
+ *
+ * 「不同意换上级」只改它在树里的位置，不改标题、不改层级、也不动正文。
+ * 目标父章节按它的原文标题节点识别 —— 这是两份方案之间唯一稳定的同一性：
+ * 基线的 id 是 b1…，模型的是 s1…。
+ *
+ * 返回 null 表示不能安全移动（目标父章节不在方案里，或目标是自己的子孙，
+ * 移过去会形成环），调用方应保留原样并说明原因。
+ */
+export function reparentSection(
+  sections: Section[],
+  sectionId: string,
+  parentHeadingId: string,
+  order: Map<string, number>,
+): Section[] | null {
+  const { sections: rest, victim } = detachSection(sections, sectionId)
+  if (!victim) return null
+
+  if (parentHeadingId === '') {
+    return sortSectionsBySourceOrder([...rest, { ...victim, children: victim.children }], order)
+  }
+
+  let parent: Section | null = null
+  let insideVictim = false
+  walkSections(rest, (s) => {
+    if (s.heading_node_id === parentHeadingId) parent = s
+  })
+  walkSections(victim.children ?? [], (s) => {
+    if (s.heading_node_id === parentHeadingId) insideVictim = true
+  })
+  if (insideVictim || !parent) return null
+
+  const parentId = (parent as Section).id
+  const rec = (list: Section[]): Section[] =>
+    list.map((s) => {
+      if (s.id === parentId) {
+        const kids = sortSectionsBySourceOrder([...(s.children ?? []), victim as Section], order)
+        return { ...s, children: kids }
+      }
+      return { ...s, children: s.children ? rec(s.children) : undefined }
+    })
+  return sortSectionsBySourceOrder(rec(rest), order)
+}
+
+/** 把重组分片追加到某章节（去重）。 */
+function appendBodyParts(sections: Section[], sectionId: string, parts: NonNullable<Section['body_parts']>): Section[] {
+  const rec = (list: Section[]): Section[] =>
+    list.map((s) => {
+      const next: Section = { ...s, children: s.children ? rec(s.children) : undefined }
+      if (s.id !== sectionId) return next
+      const merged = [...(s.body_parts ?? [])]
+      for (const bp of parts) {
+        if (!merged.some((x) => x.node_id === bp.node_id && x.part === bp.part)) merged.push({ ...bp })
+      }
+      return { ...next, body_parts: merged }
+    })
+  return rec(sections)
 }
 
 // ---------------------------------------------------------------- claim sites
@@ -583,6 +1035,29 @@ export function setSectionTitle(sections: Section[], sectionId: string, title: s
       }
       return { ...s, children: s.children ? rec(s.children) : undefined }
     })
+  return rec(sections)
+}
+
+/**
+ * 修改章节层级；会让树不合法时返回 null。
+ *
+ * 层级不是孤立数字：它必须比父级深、比每个子级浅。模型把一个章节整体
+ * 挪深/挪浅时，只有满足这两个约束才能还原，否则应当交给人手动调整。
+ */
+export function setSectionLevel(sections: Section[], sectionId: string, level: number): Section[] | null {
+  const found = locateSection(sections, sectionId, null)
+  if (!found) return null
+  const victim = found.list[found.index]
+  if (level < 1 || level > 4) return null
+  if (found.parent && level <= found.parent.level) return null
+  if ((victim.children ?? []).some((c) => c.level <= level)) return null
+
+  const rec = (list: Section[]): Section[] =>
+    list.map((s) =>
+      s.id === sectionId
+        ? { ...s, level }
+        : { ...s, children: s.children ? rec(s.children) : undefined },
+    )
   return rec(sections)
 }
 
