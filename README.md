@@ -112,6 +112,17 @@ govdoc.exe
 
 ### 从源码构建
 
+项目根目录的 `build.ps1` 一次做完下面两步，产物直接是项目根目录的 `govdoc.exe`：
+
+```powershell
+pwsh .\build.ps1              # 构建前端 + 编译 exe
+pwsh .\build.ps1 -SkipFrontend  # 只改了 Go 代码时，复用现有 web/dist
+```
+
+脚本会在任一步失败时停下并说明原因，不会留下"看起来成功"的半成品。需要 PowerShell 7（`pwsh`）。
+
+也可以手动执行：
+
 ```bash
 # 1. 构建前端（产物 web/dist 会被内嵌进二进制）
 cd web
