@@ -154,6 +154,13 @@ docker run -d --name govdoc \
 # 打开 http://localhost:8080
 ```
 
+首次使用可以固定到某个提交，免得 `latest` 随更新漂移：
+
+```bash
+docker run -d --name govdoc -p 8080:8080 -v govdoc-data:/data \
+  ghcr.io/cn-maul/govdoc:sha-0260939
+```
+
 也可以直接用仓库里的 compose 示例（在 `deploy/` 下，含健康检查与数据卷）：
 
 ```bash
