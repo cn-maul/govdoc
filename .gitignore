@@ -36,6 +36,8 @@ Thumbs.db
 *.local.json
 # govdoc.config.json 是 exe 同目录的运行配置，保存了 API Key，只能留在本机。
 /govdoc.config.json
+# 构建脚本被运行中的 exe 占用时会写出带波浪号的临时产物。
+/govdoc.exe~
 
 # ---- e2e 输出 ----
 /out/
