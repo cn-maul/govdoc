@@ -1,0 +1,37 @@
+# 构建上下文只需要源码与依赖清单。
+#
+# web/dist 会被镜像里的前端构建阶段重新生成：提交进仓库的那份是给
+# `go build` 直接用的，不能让镜像复用它——否则改了前端却没重新构建时，
+# 镜像里会是旧界面。
+web/dist/
+web/node_modules/
+web/.vite/
+web/*.tsbuildinfo
+
+# Go 构建产物与本地测试输出
+govdoc
+govdoc.exe
+govdoc.exe~
+*.test
+out/
+
+# 本地配置：里面有 API Key，绝不能进入镜像层
+govdoc.config.json
+.env
+.env.local
+*.local.json
+
+# 版本库与编辑器
+.git/
+.gitignore
+.github/
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
+# 文档与许可证不参与编译，排除后构建上下文更小
+docs/
+README.md
+LICENSE

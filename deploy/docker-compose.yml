@@ -1,0 +1,39 @@
+# GovDoc 单容器部署示例。
+#
+# 用法：
+#   cd deploy
+#   docker compose up -d
+#   打开 http://localhost:8080
+#
+# 设置（含 API Key）保存在命名卷里，容器重建不会丢；
+# 也可以第一次用环境变量直接注入，之后在界面里改。
+
+services:
+  govdoc:
+    image: ghcr.io/cn-maul/govdoc:latest
+    container_name: govdoc
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - govdoc-data:/data
+    environment:
+      TZ: Asia/Shanghai
+      # 可选：首次启动前直接指定模型连接，省去在界面里填。
+      # 一旦在界面里保存过，设置文件里的值会覆盖这里的同名项。
+      # GOVDOC_ENDPOINT: https://api.deepseek.com/v1
+      # GOVDOC_MODEL: deepseek-chat
+      # GOVDOC_API_KEY: sk-xxxx
+    # 容器以非 root（uid 10001）运行；若挂载的是宿主机目录而非命名卷，
+    # 需要先把它 chown 给 10001，否则设置无法保存。
+    healthcheck:
+      # busybox 的 wget 在 alpine 里一定存在，但用 sh 包一层更稳：
+      # 非 2xx 时 wget 的退出码与 sh 的短路判断都不依赖额外工具。
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  govdoc-data:

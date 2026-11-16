@@ -140,6 +140,60 @@ cd ..
 go build -o govdoc.exe ./cmd/govdoc
 ```
 
+### 用 Docker 运行
+
+镜像由 GitHub Actions 构建并发布到 GitHub Container Registry，本机不需要装 Go、
+Node 或 pnpm，只要 Docker：
+
+```bash
+docker run -d --name govdoc \
+  -p 8080:8080 \
+  -v govdoc-data:/data \
+  ghcr.io/cn-maul/govdoc:latest
+
+# 打开 http://localhost:8080
+```
+
+也可以直接用仓库里的 compose 示例（在 `deploy/` 下，含健康检查与数据卷）：
+
+```bash
+cd deploy
+docker compose up -d
+```
+
+容器版和桌面版的区别只有三点，都是为了适配容器而做的：
+
+| 项目 | 桌面版 | 容器版 |
+|---|---|---|
+| 监听地址 | `127.0.0.1:8765`（只允许本机访问） | `0.0.0.0:8080`（由端口映射决定谁能访问） |
+| 设置文件 | exe 同目录的 `govdoc.config.json` | `/data/govdoc.config.json`，由 `GOVDOC_CONFIG_DIR` 指定 |
+| 运行用户 | 当前用户 | 非 root（uid 10001） |
+
+**设置怎么保存**：容器里的 `/data` 是挂载卷，API Key 与自定义排版配置都写在那里，
+容器重建不丢。若改用宿主机目录挂载，记得把它 `chown` 给 `10001`，否则保存会失败
+（界面会明确提示，不会假装存上了）。
+
+**关于字体**：预览是浏览器渲染的，用的是**你本机**的字体；导出的 `.docx` 只记录字体名，
+不嵌入字体文件。因此镜像里刻意不装中文字体——装了也影响不到这两者，只会让镜像变大。
+打开下载的公文时，字体是否齐全取决于打开它的那台电脑。
+
+> 镜像只构建 `linux/amd64`。需要其它架构时，改 `.github/workflows/docker.yml` 里的
+> `platforms` 与 Dockerfile 的 `TARGETARCH` 即可。
+
+### 镜像的标签规则
+
+每次推送到 `main` 会构建并推送镜像，标签规则：
+
+| 触发 | 标签 |
+|---|---|
+| 推送到 `main` | `latest`、`main`、`sha-<短哈希>` |
+| 打 `v1.2.3` 标签 | `1.2.3`、`1.2`、`sha-<短哈希>`（不会覆盖 `latest`） |
+| Pull Request | 只构建不推送（用于验证 Dockerfile） |
+| 手动触发 | 同分支推送 |
+
+工作流在推送后还会**真的把镜像跑起来**：等 `/api/health` 返回 200，并断言设置文件落在
+`/data`、进程不是 root。镜像是本机无法验证的产物，所以这一步放在 CI 里做。
+
 ---
 
 ## 使用流程

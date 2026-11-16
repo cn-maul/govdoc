@@ -46,6 +46,15 @@ import (
 // start.
 var ErrNoConfigDir = errors.New("config: 无法确定可写入的设置目录")
 
+// envConfigDir overrides the settings directory.
+//
+// The desktop build keeps settings next to the executable, which is what makes
+// the folder portable. A container image breaks that assumption: the binary
+// sits in a root-owned, read-only layer, so "beside the executable" would turn
+// every save into a permission error. The image points this variable at a
+// volume instead (see deploy/docker).
+const envConfigDir = "GOVDOC_CONFIG_DIR"
+
 // File is the on-disk shape of the settings file.
 //
 // It is a separate type from the server's runtime config so that changing how
@@ -123,7 +132,15 @@ type Store struct {
 // environments), it falls back to the working directory so the tool still
 // starts; a settings file that lands somewhere unexpected is better than one
 // that is silently never written.
+//
+// GOVDOC_CONFIG_DIR overrides the directory. A container image is the reason:
+// the executable lives in a read-only, root-owned location, so "beside the
+// binary" would make every save fail. There the entrypoint points this at a
+// volume, while the desktop build keeps the folder-next-to-the-exe behaviour.
 func DefaultPath() (string, error) {
+	if dir := strings.TrimSpace(os.Getenv(envConfigDir)); dir != "" {
+		return filepath.Join(dir, "govdoc.config.json"), nil
+	}
 	dir, err := ExeDir()
 	if err != nil || dir == "" {
 		wd, wderr := os.Getwd()

@@ -366,6 +366,7 @@ func usage() {
   GOVDOC_API_KEY    LLM API Key
   GOVDOC_MODEL      模型名称
   GOVDOC_PROTOCOL   协议名
+  GOVDOC_CONFIG_DIR 设置文件所在目录（默认在 exe 同目录；容器里指向挂载卷）
 
 示  例:
   govdoc -endpoint https://api.deepseek.com/v1 -api-key sk-xxx -model deepseek-chat

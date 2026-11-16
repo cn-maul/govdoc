@@ -1,0 +1,122 @@
+# 构建 linux/amd64 镜像并推送到 GitHub Container Registry。
+#
+# 为什么需要 CI：本机没有 Docker，镜像是这台机器上唯一没法本地验证的产物。
+# 因此这里把「前端构建 + 交叉编译 + 镜像构建 + 一次真实启动自检」整套放在
+# runner 上跑，失败会在 Actions 页面直接给出是哪一步。
+name: docker
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # QEMU 不需要：只构建 runner 原生支持的 amd64。
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 计算镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+
+      # PR 只构建不推送：fork 的 PR 没有 packages:write，也无法写本仓库的包。
+      - name: 登录 ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 镜像是这台机器上唯一无法本地验证的产物，所以在这里真的启动一次：
+      # 能起来、健康检查通过、设置文件落在挂载卷上，才算构建成功。
+      - name: 启动自检
+        run: |
+          set -euo pipefail
+          # 用本次构建的 digest 引用刚推上去的那一份，而不是按标签重新拉：
+          # 标签可能被并发运行改写，digest 不会。
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}"
+          echo "自检镜像: $IMAGE"
+          docker run -d --name govdoc-ci \
+            -p 8080:8080 \
+            -e GOVDOC_MODEL=ci-probe \
+            -e GOVDOC_ENDPOINT=http://127.0.0.1:1/v1 \
+            -e GOVDOC_API_KEY=probe \
+            "$IMAGE"
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/api/health > /tmp/health.json; then
+              cat /tmp/health.json
+              break
+            fi
+            sleep 1
+          done
+
+          if ! curl -fsS http://127.0.0.1:8080/api/health > /dev/null; then
+            echo "健康检查失败，容器日志：" >&2
+            docker logs govdoc-ci >&2
+            exit 1
+          fi
+
+      - name: 检查容器内设置路径与权限
+        if: success()
+        run: |
+          set -euo pipefail
+          # 设置文件必须落在 /data（挂载卷），而不是镜像层里的只读目录。
+          path="$(docker exec govdoc-ci /usr/local/bin/govdoc -settings-path)"
+          echo "设置文件: $path"
+          test "$path" = "/data/govdoc.config.json"
+
+          # 非 root 运行是镜像的安全前提；uid 10001 是 Dockerfile 里建的账号。
+          uid="$(docker exec govdoc-ci id -u)"
+          test "$uid" = "10001"
+
+          # 真正写一次设置，证明挂载卷对运行用户可写。
+          # 这是镜像里「能存住 API Key」的关键路径，只查路径不查权限会漏掉它。
+          docker exec govdoc-ci sh -c 'printf "{\"version\":2}" > /data/.write-probe && rm -f /data/.write-probe'
+
+      - name: 清理
+        if: always()
+        run: docker rm -f govdoc-ci || true

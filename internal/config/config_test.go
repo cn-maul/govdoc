@@ -335,6 +335,44 @@ func TestDefaultPathIsBesideTheExecutable(t *testing.T) {
 	}
 }
 
+// TestConfigDirEnvOverridesExecutableDir: a container image cannot write next
+// to its binary (root-owned, read-only layer), so the image sets
+// GOVDOC_CONFIG_DIR to a volume. That override must win over the "beside the
+// executable" rule the desktop build relies on.
+func TestConfigDirEnvOverridesExecutableDir(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(envConfigDir, dir)
+
+	p, err := DefaultPath()
+	if err != nil {
+		t.Fatalf("DefaultPath: %v", err)
+	}
+	if want := filepath.Join(dir, "govdoc.config.json"); p != want {
+		t.Errorf("设置文件路径 = %q, 期望 %q", p, want)
+	}
+}
+
+// TestConfigDirEnvBlankFallsBack keeps the override from breaking the desktop
+// case: an empty variable is not a directory, it means "no override".
+func TestConfigDirEnvBlankFallsBack(t *testing.T) {
+	t.Setenv(envConfigDir, "   ")
+
+	p, err := DefaultPath()
+	if err != nil {
+		t.Skipf("无法确定可执行文件目录（测试环境）: %v", err)
+	}
+	if filepath.Base(p) != "govdoc.config.json" {
+		t.Errorf("设置文件名 = %q", p)
+	}
+	exeDir, err := ExeDir()
+	if err != nil || exeDir == "" {
+		t.Skip("无法确定可执行文件目录")
+	}
+	if filepath.Dir(p) != exeDir {
+		t.Errorf("空白环境变量应回退到 exe 同目录: 得到 %s, 期望 %s", filepath.Dir(p), exeDir)
+	}
+}
+
 // TestLoadSeedsBuiltinProfiles: the program must be usable on first run — the
 // profiles are created when the settings file does not exist yet, so the user
 // never has to create one before choosing one.
