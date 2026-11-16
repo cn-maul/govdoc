@@ -94,6 +94,20 @@ interface State {
   jobId: string
   stages: StageEvent[]
   analyzing: boolean
+  /**
+   * 本地基线已经产出了可预览的方案，但还没生成好可下载文件。
+   *
+   * 上传后的「正在解析文件…」只表示上传请求本身；备稿是后台工作，不能让它
+   * 压在上传状态上，否则用户会以为服务卡死在解析阶段。
+   */
+  preparing: boolean
+  /**
+   * 正在跑的是哪一类处理。
+   *
+   * `baseline` 只是按原文结构套排版规则，不发模型请求，也不是「AI 处理」；
+   * 状态文字必须区分开，否则用户会以为上传后已经调用过模型。
+   */
+  analysisMode: 'idle' | 'baseline' | 'ai'
   analysisError: string
 
   // 方案与校验
@@ -189,6 +203,8 @@ const state = reactive<State>({
   jobId: '',
   stages: [],
   analyzing: false,
+  preparing: false,
+  analysisMode: 'idle',
   analysisError: '',
 
   plan: null,
@@ -1048,6 +1064,7 @@ export async function startAnalysis(
 ): Promise<void> {
   closeEvents()
   state.analyzing = true
+  state.analysisMode = baselineOnly ? 'baseline' : 'ai'
   state.analysisError = ''
   state.stages = []
   state.partialPlan = null
@@ -1055,6 +1072,25 @@ export async function startAnalysis(
   state.partialRecompose = []
   state.render = null
   state.downloaded = []
+
+  // 本地基线是同步算出来的，不需要模型，也不需要等待 SSE 推流。
+  // 直接 POST 后用 GET /plan 取结果：少一个长连接，就不会出现「事件流
+  // 一直不结束、界面一直转圈」这种卡死。
+  if (baselineOnly) {
+    try {
+      await api.startPlan(docId, { baseline: true })
+      const res = await api.getPlan(docId)
+      const staged = applyPlanResult(res.plan, res.report, undefined, res.structure)
+      if (staged) await submitPlan(docId, false)
+    } catch (err) {
+      state.analysisError = fail('无法生成排版方案', err)
+      notify('error', state.analysisError)
+    } finally {
+      state.analyzing = false
+      state.analysisMode = 'idle'
+    }
+    return
+  }
 
   try {
     const req: {
@@ -1067,12 +1103,12 @@ export async function startAnalysis(
     if (direction) req.direction = direction
     // 省略表示沿用服务端保存的偏好；显式传值才覆盖它。
     if (allowEdits !== undefined) req.allow_edits = allowEdits
-    if (baselineOnly) req.baseline = true
     const { job_id } = await api.startPlan(docId, req)
     state.jobId = job_id
   } catch (err) {
     state.analysisError = fail('无法开始分析', err)
     state.analyzing = false
+    state.analysisMode = 'idle'
     return
   }
 
@@ -1088,6 +1124,7 @@ export async function startAnalysis(
       settled = true
       closeEvents()
       state.analyzing = false
+      state.analysisMode = 'idle'
       state.partialPlan = null
       state.partialEdits = []
       state.partialRecompose = []
@@ -1136,6 +1173,7 @@ export async function startAnalysis(
       if (!staged || !frame.plan) {
         closeEvents()
         state.analyzing = false
+        state.analysisMode = 'idle'
         resolve()
         return
       }
@@ -1172,6 +1210,29 @@ export async function startAnalysis(
       }
     })
   })
+}
+
+/**
+ * 上传后的本地排版：按原文结构套规则，并把 DOCX 先备好（不自动下载）。
+ *
+ * 用户要的流程是「上传 → 左侧立刻看到排好的稿子 → 需要就点 AI 处理，
+ * 不需要就直接下载」。所以这里不发模型请求，只跑 baseline，然后悄悄调用
+ * 一次 render；文件留在 state.render 里，「下载公文」按钮随即可用。
+ */
+export async function prepareDocument(docId: string): Promise<void> {
+  if (docId === '') return
+  // 上传状态在解析响应回来时就结束了；本地排版与备稿在后台继续。
+  // 这里不再 await，调用方（上传按钮）才能立刻恢复成可点击状态。
+  void (async () => {
+    await startAnalysis(docId, '', undefined, undefined, true)
+    if (!state.plan || !reportOK(state.report)) return
+    state.preparing = true
+    try {
+      await renderDocument(docId, { download: false })
+    } finally {
+      state.preparing = false
+    }
+  })()
 }
 
 /** SSE 帧解析：data 不是合法 JSON 时返回 null 而不是抛出，避免打断整条流。 */
@@ -1342,6 +1403,10 @@ export function editPlan(mutate: (plan: Plan) => Plan): void {
   if (!state.plan) return
   state.plan = normalizePlan(mutate(clonePlan(state.plan)))
   state.dirty = true
+  // 磁盘上那份 DOCX 是旧方案排出来的：预览已改，文件没改。继续留着会让
+  // 「下载公文」把与屏幕不一致的稿子交出去，所以编辑一发生就作废。
+  state.render = null
+  state.downloaded = []
   editRevision++
   scheduleVerify()
 }
@@ -1464,6 +1529,8 @@ export function resetDocument(): void {
   state.stages = []
   state.jobId = ''
   state.analyzing = false
+  state.preparing = false
+  state.analysisMode = 'idle'
   state.analysisError = ''
   state.dirty = false
   state.chat = []
@@ -1487,7 +1554,11 @@ export function resetDocument(): void {
  * 这一步不该再让他去找按钮；同时「下载公文文档」主按钮会一直留着，因为浏览器
  * 的自动下载可能被拦截、被取消，或被存到了用户找不到的地方。
  */
-export async function renderDocument(docId: string): Promise<void> {
+export async function renderDocument(
+  docId: string,
+  opts: { download?: boolean } = {},
+): Promise<void> {
+  const download = opts.download ?? true
   if (!state.plan) {
     notify('error', '尚未生成结构方案，请先分析文档。')
     return
@@ -1516,11 +1587,16 @@ export async function renderDocument(docId: string): Promise<void> {
       return
     }
 
-    triggerDownload(api.fileURL(res.file_id), res.filename)
-    markDownloaded(res.file_id)
+    if (download) {
+      triggerDownload(api.fileURL(res.file_id), res.filename)
+      markDownloaded(res.file_id)
+    }
 
     const applied = res.diff?.changed?.length ?? 0
     const unapplied = res.diff?.unapplied?.length ?? 0
+    if (!download) {
+      return
+    }
     if (applied > 0) {
       notify(
         'ok',

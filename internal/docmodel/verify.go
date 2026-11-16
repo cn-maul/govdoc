@@ -723,20 +723,21 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 					}
 					prev = o
 				}
-				// A source heading listed as section *body* is rendered as a
-				// heading by the assembler (its own level wins), which puts a
-				// second heading of that level on the page. The likely cause
-				// is a heading paragraph that should have been named by some
-				// section's heading_node_id: the coverage tally looks perfect,
-				// so nothing else fires, and the duplicate is visible only on
-				// the printed page.
-				if n, found := doc.Node(id); found && n.Kind == KindHeading {
+				// A source heading listed as body of *another* section is a
+				// deliberate demotion: the plan says that line is prose, not
+				// a chapter title. That is the correct reading of a Word
+				// "标题 2" paragraph such as "（一）具有中华人民共和国国籍；".
+				// But a heading listed as body of the very section that names
+				// it as its heading is a real duplicate: the page would show
+				// the same line twice, once as a heading and once as prose.
+				if n, found := doc.Node(id); found && n.Kind == KindHeading &&
+					s.HeadingNodeID == id {
 					rep.HeadingsAsBody++
 					rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
-						Code: "heading_as_body", Severity: SevWarning,
+						Code: "heading_as_body", Severity: SevError,
 						Message: fmt.Sprintf(
-							"章节 %s 把原文标题段 %s（%q）当作正文收录，成品中该标题会再次出现；"+
-								"若它本就是章节标题，请改由某个章节的 heading_node_id 指向它",
+							"章节 %s 既把原文标题段 %s（%q）当作章节标题，又把它收录进正文，成品中会出现两次；"+
+								"请从 body_node_ids 中移除它",
 							s.ID, id, truncate(n.Text, 30)),
 						NodeIDs: []string{id},
 					})

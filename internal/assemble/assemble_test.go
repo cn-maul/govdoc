@@ -386,6 +386,43 @@ func TestNumberedHeadingKeepsItsOwnNumberAcrossLevels(t *testing.T) {
 	}
 }
 
+// TestBodyClaimOverridesSourceHeadingStyle: real .docx files sometimes style a
+// numbered clause as "标题 2" even though it is prose ("（一）具有中华人民共和国
+// 国籍；"). When the plan puts that paragraph in a section's body, the paragraph
+// must be printed as 正文 — not promoted back to a heading by its source style.
+// Promoted clauses all carry KeepWithNext, which is what pushed a whole run of
+// them onto page two and left page one half empty.
+func TestBodyClaimOverridesSourceHeadingStyle(t *testing.T) {
+	doc := src(
+		head("n0001", "一、报考条件", 1),
+		para("n0002", "报考者应当具备下列资格条件："),
+		head("n0003", "（一）具有中华人民共和国国籍；", 2),
+		head("n0004", "（二）具有良好的政治素质和道德品行。", 2),
+	)
+	plan := &docmodel.Plan{
+		Sections: []docmodel.Section{
+			{ID: "s1", Title: "一、报考条件", Level: 1, HeadingNodeID: "n0001",
+				BodyNodeIDs: []string{"n0002", "n0003", "n0004"}},
+		},
+	}
+	res, err := Build(doc, plan, spec())
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	roles := map[string]docmodel.Role{}
+	for _, b := range res.Doc.Blocks {
+		roles[b.NodeID] = b.Role
+	}
+	if roles["n0003"] != docmodel.RoleBody || roles["n0004"] != docmodel.RoleBody {
+		t.Errorf("正文中的编号条款应渲染为 body，实际 n0003=%q n0004=%q",
+			roles["n0003"], roles["n0004"])
+	}
+	if roles["n0001"] != docmodel.RoleHeading1 {
+		t.Errorf("真正的章节标题应保持 heading1，实际 %q", roles["n0001"])
+	}
+}
+
 // TestDetectHeadingNumber covers the form→level mapping directly.
 func TestDetectHeadingNumber(t *testing.T) {
 	cases := []struct {

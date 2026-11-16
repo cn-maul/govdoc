@@ -719,6 +719,18 @@ func HeadingRole(level int) Role {
 	return RoleHeading4
 }
 
+// IsHeading reports whether the role is one of the four 层次序数 headings.
+// Renderers use it to avoid chaining KeepWithNext across a run of consecutive
+// headings: Word then treats the whole run as one unbreakable block and can
+// push it onto the next sheet, leaving the previous page half empty.
+func (r Role) IsHeading() bool {
+	switch r {
+	case RoleHeading1, RoleHeading2, RoleHeading3, RoleHeading4:
+		return true
+	}
+	return false
+}
+
 // OutBlock is one block of the rendered document. Text is copied verbatim
 // from the source node named by NodeID; only Role, numbering and page
 // placement are decided downstream.

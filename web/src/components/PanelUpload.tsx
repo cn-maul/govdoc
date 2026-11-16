@@ -4,6 +4,9 @@
  * 只做两件事：选文件、选用哪套排版规则。模型连接已移到「设置」页 ——
  * 那是应用级设置，放在这里会让人以为每换一份文件就要重填一次 API Key。
  *
+ * 上传后立即按原文结构 + 所选规则生成一份可预览、可下载的稿子；AI 改写
+ * 是工作台里单独的一步，不是上传的必经环节。
+ *
  * 排版规则在这里选，是因为它是**逐文档**的选择：同一批文件里可能既有公文也有
  * 报告，各用各的版式。规则一旦在上传时确定，文档就记住了它，之后改默认配置
  * 也不会把已上传的文档换掉版式。
@@ -17,6 +20,7 @@ import {
   gov,
   loadSource,
   notify,
+  prepareDocument,
   uploadDocument,
 } from '../store/govdoc'
 import { useGov } from '../store/useGov'
@@ -78,10 +82,13 @@ export default function PanelUpload({ onDone }: { onDone: () => void }) {
 
   async function beginUpload(file: File): Promise<void> {
     const ok = await uploadDocument(file, gov.selectedProfile)
-    if (ok) {
-      // 顺带把原文读回来，校对区左栏才能立刻逐字显示。
-      if (gov.upload) void loadSource(gov.upload.doc_id)
-    }
+    if (!ok || !gov.upload) return
+
+    const id = gov.upload.doc_id
+    // 顺带把原文读回来，校对区左栏才能立刻逐字显示。
+    void loadSource(id)
+    // 本地规则先出一份可用的稿子：不需要模型，也不会改动原文。
+    await prepareDocument(id)
   }
 
   // ---------------------------------------------------------------- 排版规则
@@ -219,7 +226,7 @@ export default function PanelUpload({ onDone }: { onDone: () => void }) {
           isDisabled={!upload}
           onPress={onDone}
         >
-          下一步：分析文档结构
+          打开排版工作台
         </Button>
       </div>
     </section>

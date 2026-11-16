@@ -53,7 +53,10 @@ import (
 //     heading is 前言: body prose that belongs to no 章节.
 //  4. A paragraph that is not a heading but begins with a 层次序数 is treated
 //     as a heading too. This is the most common shape of a real-world upload:
-//     the author typed "一、总体要求" as a plain paragraph.
+//     the author typed "一、总体要求" as a plain paragraph. A numbered
+//     sentence is not a heading: "（一）具有中华人民共和国国籍；" begins with
+//     a marker but continues as prose, and cutting there invents a chapter
+//     for every clause of a numbered list.
 //  5. Nesting comes from the level sequence. A document that skips a level
 //     (一、 straight to （1）) is placed one step deeper, because a tree cannot
 //     express a gap without fabricating a level.
@@ -92,10 +95,18 @@ func Build(doc *docmodel.Document) *docmodel.Plan {
 			continue
 		}
 		if n.Kind == docmodel.KindHeading {
+			// A Word heading style is strong evidence, but real documents also
+			// style each clause of a numbered list as a heading. A numbered
+			// heading whose text is a complete sentence is a clause, not a
+			// chapter: cutting there prints every clause as its own 二级标题
+			// and, with KeepWithNext, pushes a run of them onto the next page.
+			if lvl := parse.NumberingLevel(n.Text); lvl > 0 && !numberedHeading(n.Text, lvl) {
+				continue
+			}
 			cutLevel[n.ID] = clampLevel(n.Level)
 			continue
 		}
-		if lvl := parse.NumberingLevel(n.Text); lvl > 0 {
+		if lvl := parse.NumberingLevel(n.Text); lvl > 0 && numberedHeading(n.Text, lvl) {
 			cutLevel[n.ID] = clampLevel(lvl)
 		}
 	}
@@ -275,6 +286,41 @@ func looksLikeTitle(text string) bool {
 		return false
 	}
 	return true
+}
+
+// numberedHeading reports whether a numbered paragraph is a heading or merely a
+// numbered clause.
+//
+// Real 公文 often number a list clause by clause — "（一）具有中华人民共和国
+// 国籍；". Those paragraphs start with a 层次序数 exactly like a heading, but
+// their text continues the sentence instead of naming a section. Cutting
+// there printed each clause in 楷体 as a 二级标题, and because every heading
+// carries KeepWithNext, a run of them was kept on one sheet: the first page
+// stopped after a few lines and the rest moved to sheet two. That is the
+// large blank at the bottom of the preview's first page.
+//
+// A heading is short and is not terminated as a sentence. Length is counted
+// in characters so a Latin passage is judged by what the reader sees.
+func numberedHeading(text string, level int) bool {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return false
+	}
+	if strings.ContainsAny(t, "。；;！？!?") {
+		return false
+	}
+	limit := 40
+	switch level {
+	case 1:
+		limit = 30
+	case 2:
+		limit = 40
+	case 3:
+		limit = 50
+	case 4:
+		limit = 60
+	}
+	return len([]rune(t)) <= limit
 }
 
 // docTitle is a fallback section title for a document with no headings: the

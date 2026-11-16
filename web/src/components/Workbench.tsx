@@ -38,6 +38,7 @@ import {
   gov,
   loadSource,
   notify,
+  prepareDocument,
   reanalyze,
   rejectDeclaredEdit,
   rejectRecompose,
@@ -1183,14 +1184,12 @@ export default function Workbench() {
     const id = gov.upload.doc_id
     void loadSource(id)
 
-    // 先按原文结构出一份可预览的初稿，模型配置好时再叠一轮语义分析。
-    // 上传与工作台在同一个页面，用户不会看到「上传成功但左边一直空着」。
-    const useModel = gov.health?.llm_configured ?? false
-    void (async () => {
-      await startAnalysis(id, '', undefined, undefined, true)
-      if (!useModel) return
-      await startAnalysis(id, '', undefined, gov.config?.allow_edits ?? true)
-    })()
+    // 上传后只按原文结构 + 当前排版规则出稿，立刻可看可下载。
+    //
+    // 大多数上传（招考公告、已有编号的通知）本地规则就够了，之前每次
+    // 都顺手跑一遍模型，既慢又会在用户没有要求时改动文字与章节归属。
+    // 需要 AI 时由用户点「AI 处理」，见 aiProcess()。
+    await prepareDocument(id)
   }
 
   return (

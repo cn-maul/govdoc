@@ -638,29 +638,23 @@ func (a *assembler) emitSection(s *docmodel.Section, depth int) {
 			// printing a paragraph twice.
 			continue
 		}
-		n, ok := a.doc.Node(id)
+		_, ok := a.doc.Node(id)
 		if !ok {
 			continue
 		}
-		// A node's own kind decides how it is rendered; the section only
-		// decides where it sits.
-		switch n.Kind {
-		case docmodel.KindTable:
-			a.emit(docmodel.RoleBody, id)
-		case docmodel.KindImage:
-			a.emit(docmodel.RoleBody, id)
-		case docmodel.KindHeading:
-			// A source heading used as body text (the model put it under a
-			// different parent than its level implies) still renders as a
-			// heading, at its own level, so the numbering stays coherent.
-			lvl := n.Level
-			if lvl < 1 || lvl > 4 {
-				lvl = level
-			}
-			a.emit(docmodel.HeadingRole(lvl), id, withLevel(lvl))
-		default:
-			a.emit(docmodel.RoleBody, id)
-		}
+		// The section decides the role: everything listed as body is emitted
+		// as 正文, whatever the upload's own style said. A heading listed as
+		// body has been deliberately demoted by the plan — the normal shape
+		// of a numbered clause list ("（一）具有中华人民共和国国籍；"), which
+		// Word may have styled as "标题 2" even though it is prose. Promoting
+		// it again would print every clause as a 二级标题; every heading also
+		// carries KeepWithNext, so Word would keep the whole run on one sheet
+		// and leave the first page half empty.
+		//
+		// Tables and images still carry their payload in the node's
+		// Rows/Image fields; emit copies both, so 正文 is the right role
+		// for them as well.
+		a.emit(docmodel.RoleBody, id)
 	}
 
 	// Recomposed paragraphs are emitted in the order the plan lists them.

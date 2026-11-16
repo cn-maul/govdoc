@@ -330,8 +330,17 @@ func (l *layout) headLines() float64 {
 // headHeightPT is the 版头 group's height: whichever is taller of the elements
 // above 发文机关标志 and the distance the standard reserves for it, plus the
 // 发文机关标志 group itself.
+//
+// The reserved distance exists only to place 发文机关标志 at its normative
+// depth. A document without one (a plain 通知 printed on 信纸, or a 公务员
+// 招考公告) has no 版头 at all, so nothing may be reserved: doing so pushed
+// the whole 主体 down by 35mm on the first sheet and produced a page break
+// Word never makes.
 func (l *layout) headHeightPT() float64 {
-	reserved := l.spec.Direction.MastheadTopMM() * ptPerMM
+	reserved := 0.0
+	if l.hasMasthead() {
+		reserved = l.spec.Direction.MastheadTopMM() * ptPerMM
+	}
 	top := 0.0
 	main := 0.0
 	for _, it := range l.head {
@@ -345,6 +354,17 @@ func (l *layout) headHeightPT() float64 {
 		reserved = top
 	}
 	return reserved + main
+}
+
+// hasMasthead reports whether the document prints 发文机关标志. Only then does
+// the direction-dependent top offset apply.
+func (l *layout) hasMasthead() bool {
+	for _, it := range l.head {
+		if it.blk.Role == docmodel.RoleMasthead {
+			return true
+		}
+	}
+	return false
 }
 
 // headTopHeightPT is the height of the 份号/密级/紧急程度 stack, which the
@@ -364,6 +384,9 @@ func (l *layout) headTopHeightPT() float64 {
 // of 发文机关标志: the direction's normative distance minus whatever the
 // 份号/密级/紧急程度 stack already occupies, never negative.
 func (l *layout) headReservePT() float64 {
+	if !l.hasMasthead() {
+		return 0
+	}
 	r := l.spec.Direction.MastheadTopMM()*ptPerMM - l.headTopHeightPT()
 	if r < 0 {
 		return 0

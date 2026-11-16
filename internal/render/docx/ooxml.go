@@ -347,12 +347,31 @@ func borderUsable(br *gbstandard.BorderRule) bool {
 }
 
 // run writes one text run.
+//
+// A source paragraph may itself contain line breaks (a 署名 and 成文日期 typed
+// into one paragraph, which is extremely common). Inside <w:t> a newline is
+// just collapsible whitespace, so writing it verbatim silently joined the two
+// lines into one — the DOCX showed "某某市人民政府办公室 2024年5月1日" while the
+// preview, which honours white-space: pre-wrap, showed two. An explicit
+// <w:br/> is what Word itself stores for that character, so the two renderers
+// print the same thing.
 func (r *render) run(st gbstandard.ParaStyle, text string, bold, italic bool) string {
 	if text == "" {
 		return ""
 	}
-	return "<w:r>" + runProps(st, bold, italic) +
-		`<w:t xml:space="preserve">` + esc(text) + "</w:t></w:r>"
+	var b strings.Builder
+	b.WriteString("<w:r>")
+	b.WriteString(runProps(st, bold, italic))
+	for i, line := range strings.Split(text, "\n") {
+		if i > 0 {
+			b.WriteString("<w:br/>")
+		}
+		b.WriteString(`<w:t xml:space="preserve">`)
+		b.WriteString(esc(line))
+		b.WriteString("</w:t>")
+	}
+	b.WriteString("</w:r>")
+	return b.String()
 }
 
 // paragraphXML writes one text paragraph. The 层次序数, when the assembler

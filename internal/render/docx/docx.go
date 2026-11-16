@@ -217,7 +217,7 @@ func (r *render) nextDrawingID() int {
 // bodyXML serializes every block in order.
 func (r *render) bodyXML(d *docmodel.Doc) (string, error) {
 	var b strings.Builder
-	for _, blk := range d.Blocks {
+	for i, blk := range d.Blocks {
 		// MustStyle falls back to 正文 for a role the spec omits, so a
 		// partially valid spec renders instead of panicking.
 		st := r.spec.MustStyle(blk.Role)
@@ -225,6 +225,17 @@ func (r *render) bodyXML(d *docmodel.Doc) (string, error) {
 		// the role's own style (GB/T 9704-2012 §4.3.2 moves 发文机关标志 with
 		// 行文方向). Both are hundredths of a line, so they add directly.
 		st.SpaceBeforeLines += blk.SpaceBeforeLines
+
+		// KeepWithNext is only safe on the *last* heading of a run. Word
+		// treats a chain of keepNext paragraphs as one unbreakable block;
+		// eight consecutive clauses styled as 二级标题 then move to the
+		// next sheet together and leave the first page half empty. A
+		// heading still stays with the paragraph it introduces, and a
+		// heading followed by another heading stays with that heading.
+		if st.KeepWithNext && blk.Role.IsHeading() &&
+			i+1 < len(d.Blocks) && d.Blocks[i+1].Role.IsHeading() {
+			st.KeepWithNext = false
+		}
 
 		switch {
 		case len(blk.Rows) > 0:

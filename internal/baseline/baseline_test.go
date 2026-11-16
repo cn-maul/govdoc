@@ -106,6 +106,61 @@ func TestBuildCutsAtNumberedParagraphs(t *testing.T) {
 	}
 }
 
+// TestBuildKeepsNumberedClausesInBody: a real 招考公告 numbers every clause
+// of a list — "（一）具有中华人民共和国国籍；". Those are not chapter titles.
+//
+// Splitting them out printed each clause in 楷体 as a 二级标题, and because
+// headings carry KeepWithNext, Word kept the whole run together and moved it
+// to the next sheet. The visible result was a first page with a few lines and
+// a large blank beneath them.
+func TestBuildKeepsNumberedClausesInBody(t *testing.T) {
+	doc := docOf(
+		p("n0001", "中央机关及其直属机构2027年度考试录用公务员公告"),
+		p("n0002", "根据公务员法等法律法规，现将有关事项公告如下："),
+		h("n0003", "一、报考条件", 1),
+		p("n0004", "报考者应当具备下列资格条件："),
+		h("n0005", "（一）具有中华人民共和国国籍；", 2),
+		h("n0006", "（二）年龄一般为18周岁以上、38周岁以下。", 2),
+		h("n0007", "（三）拥护中华人民共和国宪法，拥护中国共产党领导和社会主义制度；", 2),
+		h("n0008", "二、报考程序", 1),
+		p("n0009", "本次招考主要采取网上报名方式。"),
+	)
+	plan := Build(doc)
+
+	got := sections(plan)
+	if len(got) != 2 {
+		t.Fatalf("应只切出 2 个真章节，实际 %d: %+v", len(got), got)
+	}
+	if got[0].HeadingNodeID != "n0003" || got[1].HeadingNodeID != "n0008" {
+		t.Errorf("章节切点错误: %q / %q", got[0].HeadingNodeID, got[1].HeadingNodeID)
+	}
+	want := []string{"n0004", "n0005", "n0006", "n0007"}
+	if strings.Join(got[0].BodyNodeIDs, ",") != strings.Join(want, ",") {
+		t.Errorf("整句列举应留在正文: %v", got[0].BodyNodeIDs)
+	}
+	if !docmodel.VerifyPlan(doc, plan).OK() {
+		t.Errorf("方案应通过校验")
+	}
+}
+
+// TestBuildKeepsShortNumberedTitles: the length and punctuation test must not
+// throw away genuine two-level headings such as “（一）主要目标”.
+func TestBuildKeepsShortNumberedTitles(t *testing.T) {
+	doc := docOf(
+		p("n0001", "一、总体要求"),
+		p("n0002", "（一）主要目标"),
+		p("n0003", "目标内容。"),
+	)
+	plan := Build(doc)
+	got := sections(plan)
+	if len(got) != 2 {
+		t.Fatalf("短标题应保留为章节，实际 %d: %+v", len(got), got)
+	}
+	if got[1].HeadingNodeID != "n0002" {
+		t.Errorf("二级标题切点错误: %q", got[1].HeadingNodeID)
+	}
+}
+
 // TestBuildNestsByLevel: 一、 then （一） then 一、 again must produce one
 // level-2 child, then a sibling at level 1.
 func TestBuildNestsByLevel(t *testing.T) {

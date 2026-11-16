@@ -67,6 +67,7 @@ const CODE_HINT: Record<string, string> = {
   parse_failed: '无法解析该文件，请确认是 .docx / .txt / .md 且未加密。',
   render_failed: '成文失败，请检查方案校验结论后重试。',
   internal_error: '服务内部错误，请查看后端日志或稍后重试。',
+  timeout: '请求超时，后端可能已停止响应；请重启 govdoc 后重试。',
 }
 
 /** 把任意异常翻译成面向用户的中文提示。 */
@@ -115,6 +116,13 @@ interface RequestOptions {
   /** 原始请求体（上传用）。 */
   body?: BodyInit
   signal?: AbortSignal
+  /**
+   * 超时（毫秒）。超时后中断请求并报「后端无响应」，而不是让界面无限转圈。
+   *
+   * 后端是本地进程，正常请求都在毫秒级；设一个上限是为了把「服务卡死」
+   * 变成可见的错误，而不是让用户看到永远不变的「正在解析文件…」。
+   */
+  timeoutMs?: number
 }
 
 async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
@@ -130,19 +138,44 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   }
 
   let res: Response
+  let timer: number | undefined
+  let timedOut = false
+  let signal = opts.signal
+  if (opts.timeoutMs && opts.timeoutMs > 0) {
+    const ctrl = new AbortController()
+    timer = window.setTimeout(() => {
+      timedOut = true
+      ctrl.abort()
+    }, opts.timeoutMs)
+    if (signal) {
+      if (signal.aborted) ctrl.abort()
+      else signal.addEventListener('abort', () => ctrl.abort(), { once: true })
+    }
+    signal = ctrl.signal
+  }
   try {
     res = await fetch(`${API_BASE}/${path.replace(/^\//, '')}`, {
       method: opts.method ?? 'GET',
       headers,
       body,
-      signal: opts.signal,
+      signal,
     })
   } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') throw err
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      if (timedOut) {
+        throw new ApiError({
+          code: 'timeout',
+          message: '后端在预期时间内没有响应，请确认 govdoc 服务仍在运行后重试。',
+        })
+      }
+      throw err
+    }
     throw new ApiError({
       code: 'network_error',
       message: '无法连接后端服务，请确认 govdoc 服务正在运行。',
     })
+  } finally {
+    if (timer !== undefined) window.clearTimeout(timer)
   }
 
   if (!res.ok) throw await parseError(res)
@@ -233,7 +266,14 @@ export const api = {
     const form = new FormData()
     form.append('file', file, file.name)
     if (profileId) form.append('profile', profileId)
-    return request<UploadResponse>('documents', { method: 'POST', body: form, signal })
+    // 解析一份 30 万字节的大文档后端也只需几百毫秒；给到 60s 是为了覆盖
+    // 超大附件，同时保证卡住时一定会报错而不是一直转圈。
+    return request<UploadResponse>('documents', {
+      method: 'POST',
+      body: form,
+      signal,
+      timeoutMs: 60_000,
+    })
   },
 
   getDocument(docId: string, signal?: AbortSignal): Promise<DocumentResponse> {
@@ -244,12 +284,15 @@ export const api = {
   startPlan(docId: string, req: PlanRequest = {}): Promise<PlanJobResponse> {
     return request<PlanJobResponse>(
       `documents/${encodeURIComponent(docId)}/plan`,
-      { method: 'POST', json: req },
+      { method: 'POST', json: req, timeoutMs: 60_000 },
     )
   },
 
   getPlan(docId: string, signal?: AbortSignal): Promise<PlanResponse> {
-    return request<PlanResponse>(`documents/${encodeURIComponent(docId)}/plan`, { signal })
+    return request<PlanResponse>(`documents/${encodeURIComponent(docId)}/plan`, {
+      signal,
+      timeoutMs: 30_000,
+    })
   },
 
   /** 提交用户编辑后的方案 → 重新校验 → 返回新的 plan + report。 */
@@ -263,7 +306,7 @@ export const api = {
   render(docId: string, req: RenderRequest): Promise<RenderResponse> {
     return request<RenderResponse>(
       `documents/${encodeURIComponent(docId)}/render`,
-      { method: 'POST', json: req },
+      { method: 'POST', json: req, timeoutMs: 120_000 },
     )
   },
 

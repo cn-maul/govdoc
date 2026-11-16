@@ -326,6 +326,49 @@ func TestHeaderElementsAreRedAndBodyIsBlack(t *testing.T) {
 
 // ---------------------------------------------------------------- pagination
 
+// 没有版头（没有 发文机关标志）时，不得为它预留 35mm/80mm 的版心上方留白。
+//
+// 这一段留白只服务于「把发文机关标志放在规定深度」。一份直接印在信纸上的
+// 通知没有版头，若仍按行文方向预留，版心会被整体下移 35mm，第一页明明装得下
+// 的内容被挤到第二页 —— 网页预览比下载下来的一页纸多出一整页空白。
+func TestNoMastheadReservesNoHeaderSpace(t *testing.T) {
+	spec := testSpec()
+
+	var blocks []docmodel.OutBlock
+	blocks = append(blocks,
+		docmodel.OutBlock{Role: docmodel.RoleTitle, Text: "关于开展安全生产大检查的通知"},
+		docmodel.OutBlock{Role: docmodel.RoleRecipient, Text: "各县（市、区）人民政府，市直各部门："},
+	)
+	for i := 0; i < 6; i++ {
+		blocks = append(blocks, bodyBlock(
+			"为深入贯彻落实上级关于安全生产工作的部署要求，经研究决定，在全市范围内开展安全生产大检查。"))
+	}
+	got := render(t, testDoc(blocks...), spec)
+
+	if pageCount(got) != 1 {
+		t.Fatalf("没有版头的短文不应分页，得到 %d 页", pageCount(got))
+	}
+	if strings.Contains(markupOf(got), "gd-head-gap") {
+		t.Errorf("没有发文机关标志时不应输出版头留白")
+	}
+}
+
+// 有版头时，规定深度仍然要留出来；否则发文机关标志会贴到版心顶端。
+func TestMastheadStillReservesItsDistance(t *testing.T) {
+	d := testDoc(
+		docmodel.OutBlock{Role: docmodel.RoleMasthead, Text: "某某市人民政府文件"},
+		docmodel.OutBlock{Role: docmodel.RoleRedLine},
+		docmodel.OutBlock{Role: docmodel.RoleTitle, Text: "关于测试的通知"},
+	)
+	l := newLayout(d, testSpec())
+	if l.headHeightPT() <= 0 {
+		t.Fatalf("有发文机关标志时必须预留版头高度")
+	}
+	if !strings.Contains(markupOf(render(t, d, testSpec())), "gd-head-gap") {
+		t.Errorf("有发文机关标志时必须输出版头留白")
+	}
+}
+
 // 页数必须随内容增加而增加：这是「模拟 A4 分页」的可检验后果。
 func TestPageCountGrowsWithContent(t *testing.T) {
 	spec := testSpec()

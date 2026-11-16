@@ -979,6 +979,59 @@ func TestRenderEditedBlockUsesTextOverStaleRuns(t *testing.T) {
 	}
 }
 
+// TestRenderKeepsInnerLineBreaks: a source paragraph can contain its own line
+// breaks (署名 and 成文日期 typed into one paragraph is the common case). Inside
+// <w:t> a newline is collapsible whitespace, so writing it verbatim joined the
+// two lines and the downloaded file disagreed with the preview, which honours
+// white-space: pre-wrap. Word stores this character as <w:br/>.
+func TestRenderKeepsInnerLineBreaks(t *testing.T) {
+	doc := &docmodel.Doc{
+		Blocks: []docmodel.OutBlock{{
+			Role: docmodel.RoleBody,
+			Text: "某某市人民政府办公室\n2024年5月1日",
+		}},
+	}
+	data, err := Render(doc, gbstandard.Default())
+	if err != nil {
+		t.Fatalf("Render 失败: %v", err)
+	}
+	xmlText := string(zipEntries(t, data)["word/document.xml"])
+	if !strings.Contains(xmlText, "<w:br/>") {
+		t.Fatalf("段内换行未写成 <w:br/>，两行会被并成一行：\n%s", xmlText)
+	}
+	if strings.Contains(xmlText, "办公室\n2024") {
+		t.Errorf("换行被原样写进了 <w:t>，Word 会把它折成空格")
+	}
+}
+
+// TestRenderDoesNotChainKeepNextAcrossHeadings: Word treats a run of
+// keepNext paragraphs as one unbreakable block. Eight clauses styled as
+// 二级标题 therefore moved to page two as a unit and left page one half
+// empty. Only the last of a consecutive heading run may keep Next.
+func TestRenderDoesNotChainKeepNextAcrossHeadings(t *testing.T) {
+	doc := &docmodel.Doc{
+		Blocks: []docmodel.OutBlock{
+			{Role: docmodel.RoleHeading2, Text: "（一）甲；"},
+			{Role: docmodel.RoleHeading2, Text: "（二）乙；"},
+			{Role: docmodel.RoleBody, Text: "正文。"},
+		},
+	}
+	data, err := Render(doc, gbstandard.Default())
+	if err != nil {
+		t.Fatalf("Render 失败: %v", err)
+	}
+	xmlText := string(zipEntries(t, data)["word/document.xml"])
+
+	// Only the second heading (the one actually followed by prose) may
+	// carry keepNext, so the first heading remains breakable.
+	if got := strings.Count(xmlText, "<w:keepNext/>"); got > 2 {
+		t.Errorf("keepNext 出现 %d 次；连续标题不应串成一条长链", got)
+	}
+	if strings.Count(xmlText, `<w:pStyle w:val="GovdocHeading2"/><w:keepNext/>`) > 1 {
+		t.Error("两个连续二级标题都带了 keepNext")
+	}
+}
+
 // TestRenderBordersFromSpec proves the 红色分隔线 and 版记 rules come from the
 // spec's BorderRule rather than a literal.
 func TestRenderBordersFromSpec(t *testing.T) {

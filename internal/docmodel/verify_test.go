@@ -657,7 +657,7 @@ func TestHeadingAsBodyIsFlagged(t *testing.T) {
 				t.Errorf("诊断应指明节点: %s", dg.Message)
 			}
 			// The message must point at the fix, not just the symptom.
-			if !strings.Contains(dg.Message, "heading_node_id") {
+			if !strings.Contains(dg.Message, "body_node_ids") {
 				t.Errorf("诊断应给出修复办法: %s", dg.Message)
 			}
 		}
@@ -667,10 +667,12 @@ func TestHeadingAsBodyIsFlagged(t *testing.T) {
 	}
 }
 
-// TestHeadingAsBodyInAnotherSectionIsAlsoFlagged: the heading may be listed as
-// body of a *different* section, which is the more likely shape when a model
-// flattens a chapter tree into one section.
-func TestHeadingAsBodyInAnotherSectionIsAlsoFlagged(t *testing.T) {
+// TestHeadingAsBodyInAnotherSectionIsAllowed: a Word "标题 2" paragraph such as
+// "（一）具有中华人民共和国国籍；" is prose that the source merely styled as a
+// heading. A plan that lists it as body of a different section is demoting it
+// deliberately, and that must render as body text rather than as a heading —
+// otherwise every clause becomes a 二级标题 and the page breaks badly.
+func TestHeadingAsBodyInAnotherSectionIsAllowed(t *testing.T) {
 	d := doc(
 		h("n0001", "一、甲", 1),
 		p("n0002", "正文甲。"),
@@ -679,15 +681,18 @@ func TestHeadingAsBodyInAnotherSectionIsAlsoFlagged(t *testing.T) {
 	)
 	plan := &Plan{
 		Sections: []Section{
-			{ID: "s1", Title: "一、甲", Level: 1, HeadingNodeID: "n0001",
-				BodyNodeIDs: []string{"n0002"}},
 			{ID: "s2", Title: "二、乙", Level: 1, HeadingNodeID: "n0003",
-				BodyNodeIDs: []string{"n0004", "n0001"}}, // n0001 as body here
+				BodyNodeIDs: []string{"n0002", "n0004"}},
+			// n0001 is demoted to prose in a later section.
+			{ID: "s3", Title: "附", Level: 1, BodyNodeIDs: []string{"n0001"}},
 		},
 	}
 	rep := VerifyPlan(d, plan)
-	if rep.HeadingsAsBody != 1 {
-		t.Errorf("应检出 1 处标题被当作正文, 实际 %d", rep.HeadingsAsBody)
+	if rep.HeadingsAsBody != 0 {
+		t.Errorf("降级为正文不应计为重复标题, 实际 %d", rep.HeadingsAsBody)
+	}
+	if !rep.OK() {
+		t.Fatalf("降级方案应通过校验: %+v", rep.Diagnostics)
 	}
 }
 
