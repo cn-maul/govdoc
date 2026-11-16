@@ -26,13 +26,16 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/cn-maul/rosetta"
 
+	"govdoc/internal/baseline"
 	"govdoc/internal/docmodel"
 )
 
@@ -52,10 +55,61 @@ const maxRepairRounds = 2
 // defaultTimeout bounds one model call when the caller does not set one.
 const defaultTimeout = 120 * time.Second
 
-// defaultMaxOutput is the output cap. A plan for a long document is verbose
-// JSON, so this is generous; the value is also what makes ErrTruncated
-// actionable rather than mysterious.
+// defaultMaxOutput is the output cap for a small document, and the floor for
+// a larger one. A plan is verbose JSON — one object per section plus up to
+// four node ids per body — so a fixed cap is right for a 通知 and too small
+// for a 100-page 规划. The cap therefore scales with the document (see
+// maxOutput); the value is also what makes ErrTruncated actionable rather
+// than mysterious.
 const defaultMaxOutput = 8192
+
+// maxOutputCeiling bounds the computed cap. Beyond this a single answer is
+// impractically slow and the model is more likely to wander than to finish.
+const maxOutputCeiling = 32768
+
+// tokensPerNode covers the plan JSON each body node costs when it is merely
+// referenced: its id in body_node_ids plus quotes and a comma, plus its share
+// of a section object.
+const tokensPerNode = 40
+
+// tokensPerRune covers documents that must be *recomposed*. A structureless
+// document can be one paragraph holding thousands of characters, and a
+// recomposition writes every output paragraph back into the answer — roughly
+// one token per character for Chinese. Sizing the cap by node count alone
+// gives exactly that document the smallest budget, which is why a one-node
+// test document overflowed an 8k cap while producing a valid plan.
+//
+// The estimate is deliberately generous and then capped: a Chinese character
+// is about 1–1.5 tokens in most tokenizers, and the plan also contains ids and
+// structure, so 2 tokens per rune bounds the recomposition payload without
+// making every large document pay for a huge cap.
+const tokensPerRune = 2
+
+// defaultTemperature is applied when the caller sets none.
+//
+// This is a classification task: the same document should produce the same
+// tree every time. Leaving it nil lets each provider pick its own default,
+// and several use 1.0 — which is why two runs over one document could differ
+// in where a borderline paragraph landed. rosetta drops this field
+// automatically for reasoning-capable requests, so setting it costs nothing
+// on models that reject sampling parameters.
+//
+// 0 (greedy decoding) rather than a small positive value: with a positive
+// temperature the same prompt has a distribution of plausible answers, and the
+// borderline decisions this task is full of (is this line a heading? does this
+// chapter start here?) are exactly the ones that flip between samples.
+const defaultTemperature = 0
+
+// defaultSeed is sent with every planning request so providers that support
+// seeding (OpenAI, and compatible gateways) return the same answer for the same
+// input. Providers without the field ignore it.
+//
+// It is not a guarantee: some gateways drop it silently, and even OpenAI only
+// calls it "best effort". It is worth sending anyway, because when it works the
+// user's "run it again and see" reproduces the same tree instead of a different
+// one — which makes a complaint about the result traceable to the prompt rather
+// than to sampling noise.
+const defaultSeed = 20240501
 
 // Config is the model connection.
 type Config struct {
@@ -70,8 +124,10 @@ type Config struct {
 	// MaxOutputTokens overrides the output cap. Zero applies the default.
 	MaxOutputTokens int
 	// Temperature is applied when non-nil. Planning is a structuring task, so
-	// the caller normally wants a low value; leaving it nil lets the provider
-	// use its own default.
+	// the caller normally wants a low value. Nil applies
+	// defaultTemperature rather than the provider's own default, because a
+	// provider default of 1.0 makes the same document produce different
+	// trees on different runs.
 	Temperature *float64
 }
 
@@ -138,10 +194,19 @@ func (e *PlanError) Error() string {
 func (e *PlanError) Unwrap() error { return e.Cause }
 
 // Client produces plans for one configuration. It is safe for concurrent use:
-// rosetta.Client is, and this type holds only immutable configuration.
+// rosetta.Client is, and the only mutable state is the capability flag below,
+// which is atomic.
 type Client struct {
 	cfg    Config
 	client *rosetta.Client
+	// noJSONMode records that this endpoint rejected response_format. Some
+	// OpenAI-compatible gateways (and a few proxies in front of them) answer
+	// 400 "unknown parameter" to a perfectly valid response_format. Rather
+	// than failing the analysis, the client drops the field for the rest of
+	// its lifetime and relies on the prompt, which already demands bare JSON.
+	// Sticky by design: a second probe per request would cost a round trip
+	// and fail the same way every time.
+	noJSONMode atomic.Bool
 }
 
 // New validates the configuration and builds a client.
@@ -149,6 +214,32 @@ func New(cfg Config) (*Client, error) {
 	if strings.TrimSpace(cfg.Endpoint) == "" ||
 		strings.TrimSpace(cfg.APIKey) == "" ||
 		strings.TrimSpace(cfg.Model) == "" {
+		return nil, ErrNotConfigured
+	}
+
+	client, err := newSDKClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{cfg: cfg, client: client}, nil
+}
+
+// ListModelsFor builds a client from a connection that is not saved yet and
+// fetches its model catalog. The settings UI needs this before the
+// configuration is complete, so Model is intentionally not required here: the
+// whole point of the request is choosing one.
+func ListModelsFor(ctx context.Context, cfg Config) ([]string, error) {
+	client, err := newSDKClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return (&Client{cfg: cfg, client: client}).ListModels(ctx)
+}
+
+// newSDKClient validates the connection and builds the SDK client.
+func newSDKClient(cfg Config) (*rosetta.Client, error) {
+	if strings.TrimSpace(cfg.Endpoint) == "" ||
+		strings.TrimSpace(cfg.APIKey) == "" {
 		return nil, ErrNotConfigured
 	}
 
@@ -187,18 +278,50 @@ func New(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("llm: 创建客户端失败：%w", err)
 	}
-	return &Client{cfg: cfg, client: client}, nil
+	return client, nil
 }
 
 // Model returns the configured model id.
 func (c *Client) Model() string { return c.cfg.Model }
 
-// maxOutput resolves the output cap.
-func (c *Client) maxOutput() int {
+// maxOutput resolves the output cap for one document.
+//
+// An explicit configuration always wins. Otherwise the cap grows with the
+// node count, because a plan's size is driven by how many paragraphs it must
+// reference: a 40-paragraph 通知 fits easily in defaultMaxOutput, while a
+// 300-paragraph 规划 does not, and truncation is a hard failure (ErrTruncated)
+// rather than something the repair loop can recover from.
+func (c *Client) maxOutput(doc *docmodel.Document) int {
 	if c.cfg.MaxOutputTokens > 0 {
 		return c.cfg.MaxOutputTokens
 	}
-	return defaultMaxOutput
+	n, chars := 0, 0
+	if doc != nil {
+		n = len(doc.ContentNodes())
+		for _, node := range doc.ContentNodes() {
+			chars += len([]rune(node.Text))
+		}
+	}
+	want := defaultMaxOutput + tokensPerNode*n + tokensPerRune*chars
+	if want > maxOutputCeiling {
+		want = maxOutputCeiling
+	}
+	return want
+}
+
+// temperature resolves the sampling temperature.
+func (c *Client) temperature() *float64 {
+	if c.cfg.Temperature != nil {
+		return c.cfg.Temperature
+	}
+	t := float64(defaultTemperature)
+	return &t
+}
+
+// seed pins sampling for providers that support it. See defaultSeed.
+func (c *Client) seed() *int {
+	s := defaultSeed
+	return &s
 }
 
 // Plan asks the model to restructure doc. progress may be nil.
@@ -228,6 +351,23 @@ type PlanOptions struct {
 	// spend effort hunting for errors. It is the default for a document the
 	// user has not flagged.
 	TrustedSource bool
+	// Partial receives snapshots of the plan while the model is still writing.
+	// A snapshot is not a verdict: the arrays can be incomplete, and only the
+	// final answer is normalized and verified. It exists so the workbench can
+	// show chapters and review items as they arrive instead of waiting for the
+	// entire JSON document.
+	Partial func(PartialPlan)
+}
+
+// PartialPlan is an incremental view of the model's answer.
+//
+// Reset marks the start of a new attempt (a repair round or a retry without
+// response_format). The client should clear any provisional rows when it sees
+// Reset, then apply the next snapshot.
+type PartialPlan struct {
+	Plan  *docmodel.Plan
+	Edits []docmodel.Edit
+	Reset bool
 }
 
 // PlanWithHint is retained for callers that only need a hint.
@@ -263,6 +403,9 @@ func (c *Client) PlanWithOptions(
 		}
 	}
 
+	partial := &partialEmitter{doc: doc, publish: opts.Partial}
+	mustRecompose := needsRecompose(doc, opts.AllowEdits)
+
 	notify(StageConnect, fmt.Sprintf("正在连接模型 %s…", c.cfg.Model))
 
 	// The conversation is built up across repair rounds, so the model can see
@@ -290,21 +433,16 @@ func (c *Client) PlanWithOptions(
 			notify(StageRepair, fmt.Sprintf("正在修正结构方案（第 %d 次）…", attempt))
 		}
 
-		resp, err := c.client.Chat(ctx, &rosetta.ChatRequest{
-			Model:           c.cfg.Model,
-			System:          systemPrompt(doc, opts.AllowEdits),
-			Messages:        messages,
-			MaxOutputTokens: c.maxOutput(),
-			Temperature:     c.cfg.Temperature,
-		})
-		rounds++
+		resp, calls, err := c.chat(ctx, doc, opts.AllowEdits, messages, partial.chunk, partial.reset)
+		partial.flush()
+		rounds += calls
 		if err != nil {
 			return lastPlan, &PlanError{Plan: lastPlan, Report: lastReport, Cause: classify(err), Rounds: rounds}
 		}
 		if resp.StopReason == rosetta.StopLength {
 			return lastPlan, &PlanError{
 				Plan: lastPlan, Report: lastReport, Rounds: rounds,
-				Cause: fmt.Errorf("%w（可增大 MaxOutputTokens，当前 %d）", ErrTruncated, c.maxOutput()),
+				Cause: fmt.Errorf("%w（可增大 MaxOutputTokens，当前 %d）", ErrTruncated, c.maxOutput(doc)),
 			}
 		}
 
@@ -337,22 +475,251 @@ func (c *Client) PlanWithOptions(
 		report := docmodel.VerifyPlan(doc, plan)
 		lastPlan, lastReport = plan, report
 
-		if report.OK() {
-			plan.Model = c.cfg.Model
-			notify(StageComplete, "分析完成")
-			return plan, nil
+		// Mechanical problems — a paragraph not listed, an id listed twice, a
+		// heading title paraphrased, a child level not deepened — are decidable
+		// from the document alone, so they are fixed locally instead of spending
+		// a model round that may return the same mistake.
+		//
+		// This runs on *valid* plans too, not just failing ones. A plan can pass
+		// verification with warnings, and two of those warnings are defects the
+		// user reported: a model-authored section title sitting above the
+		// source's own heading paragraph prints the heading twice, and a
+		// rewritten heading never appears in the review list. Both are
+		// repairable exactly, so returning the plan untouched would leave the
+		// defect for the user to discover in the exported file.
+		//
+		// The fixes are attached to the plan as notes, because a repair the user
+		// cannot see would be a silent change.
+		fixed, fixes := baseline.Repair(doc, plan)
+		candidate, verdict := plan, report
+		if len(fixes) > 0 {
+			frep := docmodel.VerifyPlan(doc, fixed)
+			// Prefer the locally repaired plan when it is valid. When the
+			// original was already invalid, the repaired version is also the
+			// better starting point for the next model round even if it still
+			// fails, because it has fewer mechanical defects.
+			if frep.OK() || !report.OK() {
+				candidate, verdict = fixed, frep
+			}
 		}
+		if len(fixes) > 0 {
+			candidate.Notes = append(candidate.Notes, fixes...)
+		}
+
+		// A run-on document is not acceptable just because every node is
+		// referenced. Without a recomposition the model has preserved the
+		// one-block shape the user asked to fix, so this goes through a
+		// targeted repair round rather than being returned as success.
+		missingRecompose := mustRecompose && len(candidate.Recompose) == 0
+		if verdict.OK() && !missingRecompose {
+			candidate.Edits = dropRecomposeConflicts(
+				candidate.Recompose, mergeEdits(doc, candidate.Edits))
+			candidate.Model = c.cfg.Model
+			msg := "分析完成"
+			if len(fixes) > 0 && !report.OK() {
+				msg = fmt.Sprintf("分析完成（本地修正了 %d 处结构问题）", len(fixes))
+			}
+			notify(StageComplete, msg)
+			return candidate, nil
+		}
+
+		plan, report = candidate, verdict
+		lastPlan, lastReport = candidate, verdict
 
 		if attempt == maxRepairRounds {
 			break
 		}
-		messages = append(messages,
-			rosetta.Assistant(text),
-			rosetta.User(repairPrompt(report, doc)),
-		)
+		next := repairPrompt(report, doc, opts.AllowEdits)
+		if missingRecompose {
+			next = recomposeRepairPrompt(doc)
+		}
+		messages = append(messages, rosetta.Assistant(text), rosetta.User(next))
 	}
 
 	return lastPlan, &PlanError{Plan: lastPlan, Report: lastReport, Rounds: rounds}
+}
+
+// chat sends one planning request, retrying once without response_format if
+// the endpoint says it does not know that field.
+//
+// It returns the number of model calls actually made, so the caller's repair
+// budget counts what it spent rather than how many loop iterations ran.
+func (c *Client) chat(
+	ctx context.Context,
+	doc *docmodel.Document,
+	allowEdits bool,
+	messages []rosetta.Message,
+	onText func(string),
+	onReset func(),
+) (*rosetta.ChatResponse, int, error) {
+	req := &rosetta.ChatRequest{
+		Model:           c.cfg.Model,
+		System:          systemPrompt(doc, allowEdits),
+		Messages:        messages,
+		MaxOutputTokens: c.maxOutput(doc),
+		Temperature:     c.temperature(),
+		Seed:            c.seed(),
+	}
+	if !c.noJSONMode.Load() {
+		req.ResponseFormat = planResponseFormat()
+	}
+
+	calls := 1
+	streamOnce := func() (*rosetta.ChatResponse, error) {
+		// rosetta's WithTimeout bounds unary calls only; a stream otherwise
+		// inherits just the caller's context. The configured timeout must still
+		// bound a silent endpoint, or a request that accepts the connection and
+		// never answers would hang until the process is restarted.
+		streamCtx := ctx
+		timeout := c.cfg.Timeout
+		if timeout <= 0 {
+			timeout = defaultTimeout
+		}
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			streamCtx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		if onReset != nil {
+			onReset()
+		}
+		stream, err := c.client.ChatStream(streamCtx, req)
+		if err != nil {
+			return nil, err
+		}
+		defer stream.Close()
+		for stream.Next() {
+			ev := stream.Event()
+			if ev != nil && ev.Type == rosetta.EventTextDelta && ev.Text != "" && onText != nil {
+				onText(ev.Text)
+			}
+		}
+		if err := stream.Err(); err != nil {
+			return nil, err
+		}
+		return stream.Partial(), nil
+	}
+
+	resp, err := streamOnce()
+	if err == nil {
+		return resp, calls, nil
+	}
+	// Some compatible gateways accept `stream:true` and answer with one whole
+	// JSON body. rosetta normally converts that into a one-shot stream, but a
+	// gateway can also reject streaming outright. Only that case falls back to
+	// unary; every other failure (auth, network, malformed answer) keeps its
+	// error so the retry below and the caller see the real cause.
+	if isStreamRejection(err) {
+		resp, uerr := c.client.Chat(ctx, req)
+		if uerr == nil {
+			return resp, calls, nil
+		}
+		err = uerr
+	}
+	// A provider that rejects response_format is not broken — it simply does
+	// not implement the field. Dropping it for the rest of this client's life
+	// makes the endpoint usable, where surfacing the 400 would make analysis
+	// impossible on that gateway.
+	if req.ResponseFormat == nil || !rejectsResponseFormat(err) || c.noJSONMode.Swap(true) {
+		return nil, calls, err
+	}
+	calls++
+	req.ResponseFormat = nil
+	resp, err = streamOnce()
+	return resp, calls, err
+}
+
+// isStreamRejection reports whether err is the endpoint saying it cannot
+// stream. A network or auth failure is not a streaming problem and must not
+// be turned into a second request that fails the same way.
+func isStreamRejection(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, rosetta.ErrNotSupported) {
+		return true
+	}
+	var apiErr *rosetta.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	if apiErr.StatusCode != 400 && apiErr.StatusCode != 404 && apiErr.StatusCode != 422 {
+		return false
+	}
+	s := strings.ToLower(apiErr.Message + " " + apiErr.Code + " " + apiErr.Type + " " + apiErr.Param)
+	for _, hint := range []string{"stream", "sse", "event-stream"} {
+		if strings.Contains(s, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+// partialEmitter turns streamed text into throttled, complete-object
+// snapshots. Parsing on every token would spend more time in the scanner than
+// the model spends producing tokens, so snapshots are emitted at a small
+// interval; the final flush catches the remainder.
+type partialEmitter struct {
+	doc     *docmodel.Document
+	publish func(PartialPlan)
+	raw     strings.Builder
+	last    time.Time
+	pending bool
+	lastSig string
+}
+
+func (p *partialEmitter) reset() {
+	p.raw.Reset()
+	p.last = time.Time{}
+	p.pending = false
+	p.lastSig = ""
+	if p.publish != nil {
+		p.publish(PartialPlan{Reset: true})
+	}
+}
+
+func (p *partialEmitter) chunk(text string) {
+	p.raw.WriteString(text)
+	p.pending = true
+	now := time.Now()
+	if !p.last.IsZero() && now.Sub(p.last) < 120*time.Millisecond {
+		return
+	}
+	p.emit()
+	p.last = now
+}
+
+func (p *partialEmitter) flush() {
+	if p.pending {
+		p.emit()
+	}
+}
+
+func (p *partialEmitter) emit() {
+	p.pending = false
+	if p.publish == nil || p.raw.Len() == 0 {
+		return
+	}
+	plan, edits := ParsePartialPlan(p.raw.String(), p.doc)
+	if plan == nil {
+		return
+	}
+	// The stream emits at a fixed interval, so a long run of text inside one
+	// object produces the same complete-object snapshot repeatedly. Sending
+	// those duplicates makes the browser re-render the whole review list for
+	// no visible change; compare the serialized snapshot instead.
+	sig, err := json.Marshal(struct {
+		Plan  *docmodel.Plan  `json:"plan"`
+		Edits []docmodel.Edit `json:"edits"`
+	}{Plan: plan, Edits: edits})
+	if err == nil {
+		next := string(sig)
+		if next == p.lastSig {
+			return
+		}
+		p.lastSig = next
+	}
+	p.publish(PartialPlan{Plan: plan, Edits: edits})
 }
 
 // ListModels fetches the endpoint's model catalog, so the UI can offer a list

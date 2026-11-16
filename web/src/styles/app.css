@@ -1,0 +1,127 @@
+/* 全局基础层：只保留 Tailwind/HeroUI 不便表达的部分。 */
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  scroll-behavior: smooth;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  background-color: var(--background);
+  color: var(--foreground);
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    'Microsoft YaHei',
+    'PingFang SC',
+    'Hiragino Sans GB',
+    sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  font-synthesis-weight: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+img,
+svg,
+video,
+canvas {
+  display: block;
+  max-width: 100%;
+}
+
+table {
+  border-collapse: collapse;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: var(--ring-offset-width);
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--accent-soft-foreground);
+}
+
+/* 分页预览：transform 不改变布局盒，外层用 1/scale 反向撑开。 */
+.gd-paper-stage {
+  overflow: auto;
+  display: flex;
+  padding: 1.5rem;
+  background: var(--surface-secondary);
+  border-radius: var(--radius-lg);
+}
+
+/*
+ * 工作台左半栏：纸张贴近卡片边缘，让 75% 缩放时的可读面积尽量大。
+ * 全屏预览仍用上面的默认留白。
+ */
+.gd-paper-stage--compact {
+  padding: 0.5rem;
+  background: transparent;
+}
+
+/*
+ * 居中用 margin:auto 而不是父级的 justify-content:center。
+ * 两者在内容放得下时看起来一样，但内容比容器宽时，justify-content:center
+ * 会把溢出的一半推到负坐标，而滚动容器到不了负坐标 —— 缩放到 150% 时纸张
+ * 左半边就永远看不见也滚不到。auto 外边距在放不下时会退化成 0，于是从左上
+ * 角开始排，滚动条覆盖全部内容。
+ */
+.gd-paper-scaler {
+  flex-shrink: 0;
+  margin: auto;
+  transform-origin: top left;
+}
+
+.gd-paper-frame {
+  width: 794px;
+  min-height: 1123px;
+  background: #fff;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 8%), 0 12px 32px rgb(0 0 0 / 12%);
+}
+
+.gd-muted {
+  color: var(--muted);
+}
+
+.gd-mono {
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 0.9em;
+}
+
+.gd-nowrap {
+  white-space: nowrap;
+}
+
+.gd-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

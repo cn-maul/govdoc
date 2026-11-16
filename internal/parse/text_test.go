@@ -202,6 +202,36 @@ func TestTextParagraphsSplitOnBlankLinesOnly(t *testing.T) {
 	}
 }
 
+// TestTextOpeningTitleIsItsOwnNode: a plain-text 公文 with the title on the
+// first line and the recipient immediately below must not be parsed as one
+// paragraph. Otherwise the title cannot be bound as a 公文要素, and the model
+// is forced to rewrite it as body prose.
+func TestTextOpeningTitleIsItsOwnNode(t *testing.T) {
+	src := "关于开展校园安全隐患排查整治工作的通知\n" +
+		"各中小学、幼儿园：为深入贯彻落实上级部署，现就有关事项通知如下。\n"
+	doc := mustParse(t, "a.txt", []byte(src))
+	if len(doc.Nodes) != 2 {
+		t.Fatalf("nodes = %d (%q), 期望标题与正文分开", len(doc.Nodes), textsOf(doc))
+	}
+	if doc.Nodes[0].Text != "关于开展校园安全隐患排查整治工作的通知" {
+		t.Errorf("标题节点 = %q", doc.Nodes[0].Text)
+	}
+	if !strings.HasPrefix(doc.Nodes[1].Text, "各中小学、幼儿园：") {
+		t.Errorf("正文节点 = %q", doc.Nodes[1].Text)
+	}
+}
+
+// TestTextOrdinarySentenceIsNotSplit: the title heuristic must not cut a
+// normal sentence in two. No recipient marker and no much-longer following
+// line means the opening line is prose.
+func TestTextOrdinarySentenceIsNotSplit(t *testing.T) {
+	src := "今天天气很好\n大家一起去公园散步并拍照留念\n"
+	doc := mustParse(t, "a.txt", []byte(src))
+	if len(doc.Nodes) != 1 {
+		t.Fatalf("普通句子被错误拆分: %q", textsOf(doc))
+	}
+}
+
 // TestTextHeadingDetection checks the Chinese title patterns, and that the
 // marker itself stays in the text (it is the source's own numbering, which the
 // assembler recognises with hasOwnNumber).

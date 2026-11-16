@@ -41,9 +41,17 @@ type stubAnalyzer struct {
 	calls int
 	// gotAllowEdits records the per-request edit permission the server passed.
 	gotAllowEdits bool
+	// partials are published before returning, to exercise the SSE bridge.
+	partials []PartialProgress
 }
 
-func (s *stubAnalyzer) Analyze(ctx context.Context, doc *docmodel.Document, opts AnalysisOptions, progress func(Progress)) (*docmodel.Plan, error) {
+func (s *stubAnalyzer) Analyze(
+	ctx context.Context,
+	doc *docmodel.Document,
+	opts AnalysisOptions,
+	progress func(Progress),
+	partial func(PartialProgress),
+) (*docmodel.Plan, error) {
 	s.calls++
 	s.gotHint = opts.Hint
 	s.gotAllowEdits = opts.AllowEdits
@@ -53,6 +61,11 @@ func (s *stubAnalyzer) Analyze(ctx context.Context, doc *docmodel.Document, opts
 	for _, st := range s.stages {
 		if progress != nil {
 			progress(st)
+		}
+	}
+	for _, snap := range s.partials {
+		if partial != nil {
+			partial(snap)
 		}
 	}
 	if s.release != nil {
@@ -269,6 +282,54 @@ func TestHealthReportsUnconfigured(t *testing.T) {
 	if h.LLMConfigured {
 		t.Error("未配置模型时应报告 llm_configured=false")
 	}
+}
+
+func TestListModelsRequiresEndpoint(t *testing.T) {
+	r := newRig(t, true)
+	resp, data := r.do(t, http.MethodPost, "/api/llm/models", api.ModelListRequest{})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("缺少接口地址应返回 400，实际 %d: %s", resp.StatusCode, data)
+	}
+}
+
+// A saved key belongs to the saved endpoint. Reusing it after the address
+// changed would send a credential to a host it was never entered for.
+func TestListModelsDoesNotReuseKeyAcrossEndpoints(t *testing.T) {
+	r := newRig(t, true)
+	resp, data := r.do(t, http.MethodPost, "/api/llm/models", api.ModelListRequest{
+		Endpoint: "https://somewhere-else.invalid/v1",
+		APIKey:   "",
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("换地址且未填 Key 时应拒绝，实际 %d: %s", resp.StatusCode, data)
+	}
+}
+
+func TestListModelsUsesAnalyzer(t *testing.T) {
+	r := newRig(t, true)
+	r.srv.SetAnalyzer(&listModelsStub{models: []string{"model-a", "model-b"}})
+	resp, data := r.do(t, http.MethodPost, "/api/llm/models", api.ModelListRequest{
+		Endpoint: "http://stub.invalid/v1",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("获取模型失败: %d %s", resp.StatusCode, data)
+	}
+	var got api.ModelListResponse
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Models) != 2 || got.Models[0] != "model-a" {
+		t.Errorf("模型列表 = %v", got.Models)
+	}
+}
+
+type listModelsStub struct {
+	*stubAnalyzer
+	models []string
+}
+
+func (s *listModelsStub) ListModels(context.Context, LLMConfig) ([]string, error) {
+	return s.models, nil
 }
 
 // ---------------------------------------------------------------- config
@@ -646,6 +707,14 @@ func TestSSEStreamsStagesAndResult(t *testing.T) {
 		{Name: "connect", Message: "正在连接模型…"},
 		{Name: "analyze", Message: "正在分析文档结构…"},
 	}
+	r.stub.partials = []PartialProgress{{
+		Plan: &docmodel.Plan{Sections: []docmodel.Section{{
+			ID: "s1", Title: "一、生成中", Level: 1,
+		}}},
+		Edits: []docmodel.Edit{{
+			NodeID: "n0001", Kind: docmodel.EditPunctuation, Before: "。", After: "；",
+		}},
+	}}
 	r.stub.release = make(chan struct{})
 
 	resp, data := r.do(t, http.MethodPost, "/api/documents/"+up.DocID+"/plan", api.PlanRequest{})
@@ -672,7 +741,10 @@ func TestSSEStreamsStagesAndResult(t *testing.T) {
 
 	body, _ := io.ReadAll(streamResp.Body)
 	text := string(body)
-	for _, want := range []string{"event: stage", "正在连接模型", "正在分析文档结构", "event: done"} {
+	for _, want := range []string{
+		"event: stage", "正在连接模型", "正在分析文档结构",
+		"event: partial", "一、生成中", "event: done",
+	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("SSE 流缺少 %q\n实际内容:\n%s", want, text)
 		}
@@ -968,9 +1040,22 @@ func TestPreviewServesSelfContainedHTML(t *testing.T) {
 func TestPreviewWithoutPlan(t *testing.T) {
 	r := newRig(t, true)
 	up := r.upload(t, "a.txt", "内容")
-	resp, _ := r.do(t, http.MethodGet, "/api/documents/"+up.DocID+"/preview", nil)
+	resp, data := r.do(t, http.MethodGet, "/api/documents/"+up.DocID+"/preview", nil)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("无方案时预览应返回 404, 实际 %d", resp.StatusCode)
+	}
+	// /preview is opened directly in an iframe or a new tab, so the body must
+	// be something a person can read. Returning the API's JSON shape showed
+	// the user a line of escaped JSON ("not_found", "该文档尚未生成结构方案")
+	// with no way to act on it.
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("预览错误应为可读 HTML, Content-Type = %q", ct)
+	}
+	if strings.Contains(string(data), `"code"`) {
+		t.Errorf("预览错误不应是 JSON: %s", data)
+	}
+	if !strings.Contains(string(data), "尚未生成结构方案") {
+		t.Errorf("预览错误缺少原因: %s", data)
 	}
 }
 
@@ -1145,4 +1230,127 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ---------------------------------------------------------------- 规则基线
+
+// TestBaselinePlanNeedsNoModel: a document that numbers its own chapters can
+// be structured without a model at all. Refusing to produce anything when no
+// API key is set was leaving the most mechanical case — a well-formed 公文 —
+// with no output path.
+func TestBaselinePlanNeedsNoModel(t *testing.T) {
+	r := newRig(t, false) // no model configured
+	up := r.upload(t, "通知.txt",
+		"关于开展检查的通知\n\n"+
+			"一、总体要求\n\n第一段。\n\n"+
+			"二、检查范围\n\n第二段。\n")
+
+	resp, data := r.do(t, http.MethodPost, "/api/documents/"+up.DocID+"/plan",
+		api.PlanRequest{Baseline: true})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("基线方案不需要模型，应返回 202, 实际 %d %s", resp.StatusCode, data)
+	}
+	var job api.PlanJobResponse
+	if err := json.Unmarshal(data, &job); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	stored, err := r.srv.store.Job(job.JobID)
+	if err != nil {
+		t.Fatalf("Job: %v", err)
+	}
+	if !stored.Wait(5 * time.Second) {
+		t.Fatal("基线方案应立即可用")
+	}
+	if r.stub.calls != 0 {
+		t.Errorf("基线模式不应调用模型, 实际 %d 次", r.stub.calls)
+	}
+
+	_, data = r.do(t, http.MethodGet, "/api/documents/"+up.DocID+"/plan", nil)
+	var out api.PlanResponse
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("decode plan: %v", err)
+	}
+	if out.Plan == nil || out.Report == nil {
+		t.Fatal("应存下方案与校验结论")
+	}
+	if !out.Report.OK() {
+		t.Fatalf("基线方案应通过校验: %+v", out.Report.Diagnostics)
+	}
+	if len(out.Plan.Sections) != 2 {
+		t.Errorf("应切出 2 个章节, 实际 %d", len(out.Plan.Sections))
+	}
+	if out.Structure == nil {
+		t.Fatal("应返回结构差异")
+	}
+	// The plan was derived FROM the source, so by definition nothing moved.
+	if len(out.Structure.Moves) != 0 {
+		t.Errorf("基线方案不应对原文结构产生移动: %+v", out.Structure.Moves)
+	}
+}
+
+// TestPlanResponseCarriesStructureDiff: the 结构变动 panel needs the diff on
+// every read, not only right after analysis — otherwise a page reload loses
+// the one piece of information VerifyPlan cannot give.
+func TestPlanResponseCarriesStructureDiff(t *testing.T) {
+	r := newRig(t, true)
+	up := r.upload(t, "通知.txt", "一、甲\n\n甲段。\n\n二、乙\n\n乙段。\n")
+
+	// A plan that swaps the two chapters: coverage is complete, so the report
+	// passes, and only the structural diff shows what happened.
+	sess, _ := r.srv.store.Session(up.DocID)
+	var a, b string
+	for _, n := range sess.Doc.Nodes {
+		if n.Text == "甲段。" {
+			a = n.ID
+		}
+		if n.Text == "乙段。" {
+			b = n.ID
+		}
+	}
+	r.stub.plan = &docmodel.Plan{Sections: []docmodel.Section{
+		{ID: "s1", Title: "二、乙", Level: 1, BodyNodeIDs: []string{b}},
+		{ID: "s2", Title: "一、甲", Level: 1, BodyNodeIDs: []string{a}},
+	}}
+
+	got := r.startPlanAndWait(t, up.DocID)
+	if got.Structure == nil {
+		t.Fatal("应返回结构差异")
+	}
+	if len(got.Structure.Moves) != 2 {
+		t.Errorf("两段都换了章节, 实际 %d 处: %+v",
+			len(got.Structure.Moves), got.Structure.Moves)
+	}
+}
+
+// TestPutPlanRecomputesStructure: the diff describes the plan currently
+// stored, so an edit must refresh it — a stale 结构变动 panel is worse than
+// none.
+func TestPutPlanRecomputesStructure(t *testing.T) {
+	r := newRig(t, true)
+	up := r.upload(t, "通知.txt", "一、甲\n\n甲段。\n\n二、乙\n\n乙段。\n")
+	sess, _ := r.srv.store.Session(up.DocID)
+
+	var ids []string
+	for _, n := range sess.Doc.Nodes {
+		if n.Kind == docmodel.KindParagraph {
+			ids = append(ids, n.ID)
+		}
+	}
+	plan := &docmodel.Plan{Sections: []docmodel.Section{
+		{ID: "s1", Title: "一、甲", Level: 1, BodyNodeIDs: []string{ids[0], ids[1]}},
+	}}
+	resp, data := r.do(t, http.MethodPut, "/api/documents/"+up.DocID+"/plan", plan)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT plan: %d %s", resp.StatusCode, data)
+	}
+	var out api.PlanResponse
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Structure == nil {
+		t.Fatal("PUT 应返回结构差异")
+	}
+	if len(out.Structure.Moves) == 0 {
+		t.Error("把第二章的段落并入第一章应被识别为移动")
+	}
 }

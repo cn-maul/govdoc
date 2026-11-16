@@ -546,6 +546,43 @@ func TestBoundTitleIsNotDuplicate(t *testing.T) {
 	}
 }
 
+// TestDuplicateElementIsOneError: a plan that binds the same role twice is
+// wrong once, not twice. The assembler emits the first binding, so reporting
+// the paragraph as both duplicate_element and duplicate_content inflates a
+// single mistake and makes the review screen look like content was both lost
+// and copied.
+func TestDuplicateElementIsOneError(t *testing.T) {
+	d := doc(
+		p("n0001", "关于开展某项工作的通知"),
+		p("n0002", "正文。"),
+	)
+	plan := &Plan{
+		Elements: []ElementBinding{
+			{Role: RoleTitle, NodeID: "n0001"},
+			{Role: RoleTitle, NodeID: "n0001"},
+		},
+		Sections: []Section{
+			{ID: "s1", Title: "章", Level: 1, BodyNodeIDs: []string{"n0002"}},
+		},
+	}
+	rep := VerifyPlan(d, plan)
+	if rep.OK() {
+		t.Fatal("重复绑定要素必须导致校验失败")
+	}
+	if rep.DuplicatedNodes != 0 {
+		t.Errorf("重复绑定不应额外记为正文重复, dup=%d", rep.DuplicatedNodes)
+	}
+	var badElement int
+	for _, dg := range rep.Diagnostics {
+		if dg.Code == "duplicate_element" {
+			badElement++
+		}
+	}
+	if badElement != 1 {
+		t.Errorf("duplicate_element 诊断数 = %d, 期望 1: %+v", badElement, rep.Diagnostics)
+	}
+}
+
 // TestDuplicateTitleOnlyWhenActuallyRepeated: a Meta.Title that differs from
 // every paragraph is a legitimate synthesized title and must not be flagged —
 // the check exists to catch a repeat, not to forbid synthesized titles.
@@ -976,5 +1013,214 @@ func TestSortNodes(t *testing.T) {
 	SortNodes(nodes)
 	if nodes[0].ID != "a" || nodes[1].ID != "b" || nodes[2].ID != "c" {
 		t.Errorf("排序错误: %v", nodes)
+	}
+}
+
+// ---------------------------------------------------------------- 顺序与重复 id
+
+// TestDuplicateSectionIDIsError: section ids are the address every client
+// operation uses. A plan with two "s1"s renders fine but makes rename/move
+// hit the wrong chapter, so it must be refused — the review screen cannot be
+// the place the ambiguity is discovered.
+func TestDuplicateSectionIDIsError(t *testing.T) {
+	d := doc(p("n0001", "甲"), p("n0002", "乙"))
+	plan := &Plan{Sections: []Section{
+		{ID: "s1", Title: "A", Level: 1, BodyNodeIDs: []string{"n0001"}},
+		{ID: "s1", Title: "B", Level: 1, BodyNodeIDs: []string{"n0002"}},
+	}}
+	rep := VerifyPlan(d, plan)
+	if rep.OK() {
+		t.Fatal("章节 id 重复必须导致校验失败")
+	}
+	var found bool
+	for _, dg := range rep.Diagnostics {
+		if dg.Code == "duplicate_section_id" && dg.Severity == SevError {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("缺少 duplicate_section_id 诊断: %+v", rep.Diagnostics)
+	}
+}
+
+// TestDuplicateSectionIDAcrossLevelsIsError is the exact shape the id
+// allocation used to produce: a parent and its first child both named "s1".
+func TestDuplicateSectionIDAcrossLevelsIsError(t *testing.T) {
+	d := doc(p("n0001", "甲"), p("n0002", "乙"))
+	plan := &Plan{Sections: []Section{
+		{ID: "s1", Title: "父", Level: 1, BodyNodeIDs: []string{"n0001"},
+			Children: []Section{
+				{ID: "s1", Title: "子", Level: 2, BodyNodeIDs: []string{"n0002"}},
+			}},
+	}}
+	rep := VerifyPlan(d, plan)
+	if rep.OK() {
+		t.Fatal("父子同名 id 必须导致校验失败")
+	}
+}
+
+// TestReorderedSectionsAreFlagged: swapping two whole chapters passes the
+// per-section check (each chapter's body is internally ascending) yet the
+// printed document shows 二、 before 一、. That must be reported.
+func TestReorderedSectionsAreFlagged(t *testing.T) {
+	d := doc(
+		h("n0001", "一、甲", 1), p("n0002", "甲段"),
+		h("n0003", "二、乙", 1), p("n0004", "乙段"),
+	)
+	plan := &Plan{Sections: []Section{
+		{ID: "s1", Title: "二、乙", Level: 1, HeadingNodeID: "n0003", BodyNodeIDs: []string{"n0004"}},
+		{ID: "s2", Title: "一、甲", Level: 1, HeadingNodeID: "n0001", BodyNodeIDs: []string{"n0002"}},
+	}}
+	rep := VerifyPlan(d, plan)
+	// Renderable: the user can reorder deliberately, so this is a warning.
+	if !rep.OK() {
+		t.Fatalf("章节整体换序应可导出（但需提示）: %+v", rep.Diagnostics)
+	}
+	if rep.SectionsOutOfOrder != 1 {
+		t.Errorf("乱序章节计数 = %d, 期望 1", rep.SectionsOutOfOrder)
+	}
+	var found bool
+	for _, dg := range rep.Diagnostics {
+		if dg.Code == "section_order" && dg.Severity == SevWarning {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("缺少 section_order 警告: %+v", rep.Diagnostics)
+	}
+}
+
+// TestSectionsInSourceOrderAreQuiet: the correct plan must not trip the check,
+// or the warning is noise.
+func TestSectionsInSourceOrderAreQuiet(t *testing.T) {
+	d := doc(
+		h("n0001", "一、甲", 1), p("n0002", "甲段"),
+		h("n0003", "二、乙", 1), p("n0004", "乙段"),
+	)
+	plan := &Plan{Sections: []Section{
+		{ID: "s1", Title: "一、甲", Level: 1, HeadingNodeID: "n0001", BodyNodeIDs: []string{"n0002"}},
+		{ID: "s2", Title: "二、乙", Level: 1, HeadingNodeID: "n0003", BodyNodeIDs: []string{"n0004"}},
+	}}
+	rep := VerifyPlan(d, plan)
+	if rep.SectionsOutOfOrder != 0 {
+		t.Errorf("顺序正确不应报告乱序, 实际 %d: %+v", rep.SectionsOutOfOrder, rep.Diagnostics)
+	}
+}
+
+// TestNestedSectionsInOrderAreQuiet guards against a false positive in the
+// depth-first walk: a parent's body precedes its children, and the next
+// sibling starts after the children end — not after the parent's own body.
+func TestNestedSectionsInOrderAreQuiet(t *testing.T) {
+	d := doc(
+		h("n0001", "一、甲", 1), p("n0002", "甲段"),
+		h("n0003", "（一）乙", 2), p("n0004", "乙段"),
+		h("n0005", "二、丙", 1), p("n0006", "丙段"),
+	)
+	plan := &Plan{Sections: []Section{
+		{ID: "s1", Title: "一、甲", Level: 1, HeadingNodeID: "n0001",
+			BodyNodeIDs: []string{"n0002"},
+			Children: []Section{
+				{ID: "s1a", Title: "（一）乙", Level: 2, HeadingNodeID: "n0003",
+					BodyNodeIDs: []string{"n0004"}},
+			}},
+		{ID: "s2", Title: "二、丙", Level: 1, HeadingNodeID: "n0005", BodyNodeIDs: []string{"n0006"}},
+	}}
+	rep := VerifyPlan(d, plan)
+	if rep.SectionsOutOfOrder != 0 {
+		t.Errorf("嵌套顺序正确不应报告乱序: %+v", rep.Diagnostics)
+	}
+}
+
+// TestPreambleAfterFirstSectionIsFlagged: the preamble is emitted under
+// 主送机关, i.e. at the front. A node taken from later in the source would be
+// moved there silently — coverage is satisfied and comparison is per node, so
+// nothing else notices.
+func TestPreambleAfterFirstSectionIsFlagged(t *testing.T) {
+	d := doc(
+		h("n0001", "一、甲", 1), p("n0002", "甲段"), p("n0003", "文末段"),
+	)
+	plan := &Plan{
+		PreambleNodeIDs: []string{"n0003"},
+		Sections: []Section{
+			{ID: "s1", Title: "一、甲", Level: 1, HeadingNodeID: "n0001", BodyNodeIDs: []string{"n0002"}},
+		},
+	}
+	rep := VerifyPlan(d, plan)
+	var found bool
+	for _, dg := range rep.Diagnostics {
+		if dg.Code == "preamble_out_of_place" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("前言取自章节之后应被提示: %+v", rep.Diagnostics)
+	}
+}
+
+// TestPreambleBeforeFirstSectionIsQuiet is the normal shape and must be clean.
+func TestPreambleBeforeFirstSectionIsQuiet(t *testing.T) {
+	d := doc(
+		p("n0001", "缘由段。"),
+		h("n0002", "一、甲", 1), p("n0003", "甲段"),
+	)
+	plan := &Plan{
+		PreambleNodeIDs: []string{"n0001"},
+		Sections: []Section{
+			{ID: "s1", Title: "一、甲", Level: 1, HeadingNodeID: "n0002", BodyNodeIDs: []string{"n0003"}},
+		},
+	}
+	rep := VerifyPlan(d, plan)
+	for _, dg := range rep.Diagnostics {
+		if dg.Code == "preamble_out_of_place" {
+			t.Errorf("正常前言不应被提示: %s", dg.Message)
+		}
+	}
+}
+
+// TestSynthesizedTitleRepeatingBodyIsError: a paragraph without heading markup
+// that the model both synthesized a section title from AND left in the body
+// prints twice. Coverage is complete, so only this check sees it.
+func TestSynthesizedTitleRepeatingBodyIsError(t *testing.T) {
+	d := doc(
+		p("n0001", "一、总体要求"),
+		p("n0002", "正文。"),
+	)
+	plan := &Plan{Sections: []Section{
+		{ID: "s1", Title: "一、总体要求", Level: 1, BodyNodeIDs: []string{"n0001", "n0002"}},
+	}}
+	rep := VerifyPlan(d, plan)
+	if rep.OK() {
+		t.Fatal("自拟标题与正文同文必须导致失败")
+	}
+	var found bool
+	for _, dg := range rep.Diagnostics {
+		if dg.Code == "duplicate_title" && strings.Contains(dg.Message, "n0001") {
+			found = true
+			if !strings.Contains(dg.Message, "heading_node_id") {
+				t.Errorf("诊断应给出修复办法: %s", dg.Message)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("缺少 duplicate_title 诊断: %+v", rep.Diagnostics)
+	}
+}
+
+// TestSynthesizedTitleMatchingHeadingIsQuiet: when the paragraph IS bound as
+// the heading, the title legitimately equals it. The line prints once.
+func TestSynthesizedTitleMatchingHeadingIsQuiet(t *testing.T) {
+	d := doc(h("n0001", "一、总体要求", 1), p("n0002", "正文。"))
+	plan := &Plan{Sections: []Section{
+		{ID: "s1", Title: "一、总体要求", Level: 1,
+			HeadingNodeID: "n0001", BodyNodeIDs: []string{"n0002"}},
+	}}
+	rep := VerifyPlan(d, plan)
+	if !rep.OK() {
+		t.Fatalf("标题绑定到原文节点时应通过: %+v", rep.Diagnostics)
+	}
+	for _, dg := range rep.Diagnostics {
+		if dg.Code == "duplicate_title" {
+			t.Errorf("不应报告 duplicate_title: %s", dg.Message)
+		}
 	}
 }

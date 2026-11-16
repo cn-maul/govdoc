@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cn-maul/rosetta"
+
 	"govdoc/internal/docmodel"
 )
 
@@ -85,7 +87,10 @@ type stubEndpoint struct {
 	requests []map[string]any
 	status   int
 	statusOf func(call int) int
-	rawBody  func(call int) string
+	// errBody customises the JSON body sent with a non-zero status, so a test
+	// can reproduce the wording a real provider uses when it rejects a field.
+	errBody func(call int) string
+	rawBody func(call int) string
 }
 
 func newStub(t *testing.T, contents ...string) *stubEndpoint {
@@ -100,18 +105,21 @@ func newStub(t *testing.T, contents ...string) *stubEndpoint {
 		s.requests = append(s.requests, req)
 		s.mu.Unlock()
 
+		code := 0
 		if s.statusOf != nil {
-			if code := s.statusOf(call); code != 0 {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(code)
-				_, _ = w.Write([]byte(`{"error":{"message":"stub failure","type":"invalid_request_error"}}`))
-				return
-			}
+			code = s.statusOf(call)
 		}
-		if s.status != 0 {
+		if code == 0 {
+			code = s.status
+		}
+		if code != 0 {
+			body := `{"error":{"message":"stub failure","type":"invalid_request_error"}}`
+			if s.errBody != nil {
+				body = s.errBody(call)
+			}
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(s.status)
-			_, _ = w.Write([]byte(`{"error":{"message":"stub failure","type":"invalid_request_error"}}`))
+			w.WriteHeader(code)
+			_, _ = w.Write([]byte(body))
 			return
 		}
 
@@ -243,6 +251,68 @@ func TestPlanParsesAndVerifies(t *testing.T) {
 	}
 }
 
+// TestPlanRepairsWarningOnlyHeadingDuplicate is the reported defect, at the
+// level the user sees it: the model answers with its own section title while
+// leaving the source heading in the body. Verification passes — the duplicates
+// are warnings — so this used to be returned untouched, and the exported file
+// printed the model's title above the author's heading.
+func TestPlanRepairsWarningOnlyHeadingDuplicate(t *testing.T) {
+	doc := &docmodel.Document{
+		SourceName: "t.docx",
+		Nodes: []docmodel.Node{
+			{ID: "n0001", Kind: docmodel.KindHeading, Level: 1, Text: "一、项目概况", Order: 0},
+			{ID: "n0002", Kind: docmodel.KindParagraph, Text: "正文。", Order: 1},
+		},
+	}
+	answer := `{
+	  "sections": [{
+	    "id": "s1",
+	    "title": "一、项目基本情况",
+	    "level": 1,
+	    "body_node_ids": ["n0001", "n0002"],
+	    "children": []
+	  }]
+	}`
+	stub := newStub(t, answer)
+	c := newClient(t, stub.URL)
+
+	plan, err := c.PlanWithOptions(context.Background(), doc, PlanOptions{AllowEdits: true}, nil)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if stub.calls() != 1 {
+		t.Errorf("可本地修正时不应再调用模型, 实际 %d 次", stub.calls())
+	}
+	if len(plan.Sections) != 1 {
+		t.Fatalf("章节数 = %d", len(plan.Sections))
+	}
+	s := plan.Sections[0]
+	if s.HeadingNodeID != "n0001" {
+		t.Errorf("标题应引用原文节点, 实际 %q", s.HeadingNodeID)
+	}
+	if s.Title != "一、项目概况" {
+		t.Errorf("成品标题应为原文, 实际 %q", s.Title)
+	}
+	if len(s.BodyNodeIDs) != 1 || s.BodyNodeIDs[0] != "n0002" {
+		t.Errorf("原标题节点应从正文移除, 实际 %v", s.BodyNodeIDs)
+	}
+	var heading *docmodel.Edit
+	for i := range plan.Edits {
+		if plan.Edits[i].Kind == docmodel.EditHeading {
+			heading = &plan.Edits[i]
+		}
+	}
+	if heading == nil {
+		t.Fatalf("标题改写应出现在校对项, 实际 %+v", plan.Edits)
+	}
+	if heading.Before != "一、项目概况" || heading.After != "一、项目基本情况" {
+		t.Errorf("校对项内容错误: %q → %q", heading.Before, heading.After)
+	}
+	if rep := docmodel.VerifyPlan(doc, plan); rep.SynthesizedHeadings != 0 {
+		t.Errorf("不应保留自拟标题, 实际 %d 个", rep.SynthesizedHeadings)
+	}
+}
+
 // TestPromptSendsIdsNotContent is the heart of the design: the model is given
 // the paragraphs to read but is never asked to retype them, and the request
 // must say so.
@@ -320,16 +390,236 @@ func TestPlanSendsConfiguredModel(t *testing.T) {
 	}
 }
 
-// TestTemperatureOmittedByDefault: sending a temperature the provider rejects
-// would fail every call, so it is only sent when configured.
-func TestTemperatureOmittedByDefault(t *testing.T) {
+// TestTemperatureDefaultsZero: planning is a classification task, so it must
+// not silently inherit a provider default of 1.0 — that makes the same
+// document produce different trees on different runs. rosetta drops the field
+// itself for reasoning-capable models, so sending it is safe everywhere.
+func TestTemperatureDefaultsZero(t *testing.T) {
 	stub := newStub(t, goodPlanJSON())
 	c := newClient(t, stub.URL)
 	if _, err := c.Plan(context.Background(), testDoc(), nil); err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
-	if _, present := stub.request(0)["temperature"]; present {
-		t.Error("未配置 temperature 时不应发送该字段")
+	got, present := stub.request(0)["temperature"]
+	if !present {
+		t.Fatal("未配置时应发送默认 temperature")
+	}
+	if f, ok := got.(float64); !ok || f != 0 {
+		t.Errorf("temperature = %v, 期望 0", got)
+	}
+}
+
+// TestSeedDefaultsFixed: temperature 0 removes most sampling variance, but a
+// provider may still choose between equally likely continuations. The seed
+// makes providers that support it reproduce the same tree.
+func TestSeedDefaultsFixed(t *testing.T) {
+	stub := newStub(t, goodPlanJSON())
+	c := newClient(t, stub.URL)
+	if _, err := c.Plan(context.Background(), testDoc(), nil); err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	got, present := stub.request(0)["seed"]
+	if !present {
+		t.Fatal("未配置时应发送默认 seed")
+	}
+	if n, ok := got.(float64); !ok || int(n) != defaultSeed {
+		t.Errorf("seed = %v, 期望 %d", got, defaultSeed)
+	}
+}
+
+// TestExplicitTemperatureWins: a caller that sets one keeps it.
+func TestExplicitTemperatureWins(t *testing.T) {
+	stub := newStub(t, goodPlanJSON())
+	c := newClient(t, stub.URL)
+	want := 0.7
+	c.cfg.Temperature = &want
+	if _, err := c.Plan(context.Background(), testDoc(), nil); err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if got, _ := stub.request(0)["temperature"].(float64); got != want {
+		t.Errorf("temperature = %v, 期望 %v", got, want)
+	}
+}
+
+// TestMaxOutputGrowsWithDocument: a large document needs a larger cap, and a
+// truncated answer is a hard failure the repair loop cannot recover from.
+func TestMaxOutputGrowsWithDocument(t *testing.T) {
+	c := &Client{cfg: Config{MaxOutputTokens: 0}}
+	small := testDoc() // 3 nodes
+	want := defaultMaxOutput + 3*tokensPerNode
+	for _, node := range small.ContentNodes() {
+		want += tokensPerRune * len([]rune(node.Text))
+	}
+	if got := c.maxOutput(small); got != want {
+		t.Errorf("小文档上限 = %d", got)
+	}
+
+	big := &docmodel.Document{}
+	for i := 0; i < 2000; i++ {
+		big.Nodes = append(big.Nodes, docmodel.Node{
+			ID: fmt.Sprintf("n%04d", i), Kind: docmodel.KindParagraph, Text: "正文",
+		})
+	}
+	if got := c.maxOutput(big); got != maxOutputCeiling {
+		t.Errorf("大文档上限应被压到天花板 %d, 实际 %d", maxOutputCeiling, got)
+	}
+}
+
+// TestMaxOutputGrowsWithTextNotJustNodeCount: the one-paragraph document is
+// the case that failed in practice. Its whole text must be written back inside
+// a recomposition, so a cap derived only from the node count is far too small.
+func TestMaxOutputGrowsWithTextNotJustNodeCount(t *testing.T) {
+	c := &Client{cfg: Config{MaxOutputTokens: 0}}
+	long := &docmodel.Document{Nodes: []docmodel.Node{{
+		ID: "n0001", Kind: docmodel.KindParagraph,
+		Text: strings.Repeat("这是一段很长的正文。", 500),
+	}}}
+	if got := c.maxOutput(long); got <= defaultMaxOutput+10*tokensPerNode {
+		t.Errorf("长单段文档的上限仍按节点数估算: %d", got)
+	}
+}
+
+// TestMaxOutputExplicitWins: an operator who set a cap gets exactly that.
+func TestMaxOutputExplicitWins(t *testing.T) {
+	c := &Client{cfg: Config{MaxOutputTokens: 1234}}
+	if got := c.maxOutput(testDoc()); got != 1234 {
+		t.Errorf("上限 = %d, 期望 1234", got)
+	}
+}
+
+// TestResponseFormatIsRequested: the schema is what stops a whole class of
+// repair rounds (fenced JSON, trailing commas, malformed ids).
+func TestResponseFormatIsRequested(t *testing.T) {
+	stub := newStub(t, goodPlanJSON())
+	c := newClient(t, stub.URL)
+	if _, err := c.Plan(context.Background(), testDoc(), nil); err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	rf, ok := stub.request(0)["response_format"].(map[string]any)
+	if !ok {
+		t.Fatal("请求应带 response_format")
+	}
+	if rf["type"] != "json_schema" {
+		t.Errorf("response_format.type = %v, 期望 json_schema", rf["type"])
+	}
+	js, _ := rf["json_schema"].(map[string]any)
+	if js == nil || js["schema"] == nil {
+		t.Errorf("缺少 json_schema.schema: %v", rf)
+	}
+}
+
+// TestSchemaMismatchFallsBackOnce: a gateway that does not know
+// response_format must not make analysis impossible. The field is dropped and
+// the request retried; the flag is sticky so later turns do not pay for a
+// second rejection each time.
+func TestSchemaMismatchFallsBackOnce(t *testing.T) {
+	stub := newStub(t, goodPlanJSON())
+	stub.statusOf = func(call int) int {
+		if call == 0 {
+			return 400
+		}
+		return 0
+	}
+	stub.errBody = func(int) string {
+		return `{"error":{"message":"unsupported parameter: response_format","type":"invalid_request_error"}}`
+	}
+	c := newClient(t, stub.URL)
+
+	plan, err := c.Plan(context.Background(), testDoc(), nil)
+	if err != nil {
+		t.Fatalf("被拒绝的 response_format 应回退而不是失败: %v", err)
+	}
+	if plan == nil {
+		t.Fatal("回退后应拿到方案")
+	}
+	if stub.calls() != 2 {
+		t.Fatalf("应调用 2 次（首次被拒 + 回退），实际 %d", stub.calls())
+	}
+	if _, present := stub.request(0)["response_format"]; !present {
+		t.Error("首次请求应带 response_format")
+	}
+	if _, present := stub.request(1)["response_format"]; present {
+		t.Error("回退请求不应再带 response_format")
+	}
+	if !c.noJSONMode.Load() {
+		t.Error("回退后应记住该端点不支持，避免每次都试探")
+	}
+}
+
+// TestSchemaFallbackIsSticky: after one rejection, later plans skip the field
+// entirely rather than paying for a rejection every time.
+func TestSchemaFallbackIsSticky(t *testing.T) {
+	stub := newStub(t, goodPlanJSON())
+	stub.statusOf = func(call int) int {
+		if call == 0 {
+			return 400
+		}
+		return 0
+	}
+	stub.errBody = func(int) string {
+		return `{"error":{"message":"unsupported parameter: response_format"}}`
+	}
+	c := newClient(t, stub.URL)
+	if _, err := c.Plan(context.Background(), testDoc(), nil); err != nil {
+		t.Fatalf("首次 Plan: %v", err)
+	}
+	before := stub.calls()
+	if _, err := c.Plan(context.Background(), testDoc(), nil); err != nil {
+		t.Fatalf("第二次 Plan: %v", err)
+	}
+	if stub.calls()-before != 1 {
+		t.Errorf("已记住不支持后，第二次应只用 1 次调用，实际 %d", stub.calls()-before)
+	}
+	if _, present := stub.request(before)["response_format"]; present {
+		t.Error("已记住不支持后仍带了 response_format")
+	}
+}
+
+// TestUnrelated400IsNotSwallowed: only a rejection that names the field
+// triggers the fallback. A 400 about something else must surface.
+func TestUnrelated400IsNotSwallowed(t *testing.T) {
+	stub := newStub(t, goodPlanJSON())
+	stub.status = 400
+	stub.errBody = func(int) string {
+		return `{"error":{"message":"invalid model id","type":"invalid_request_error"}}`
+	}
+	c := newClient(t, stub.URL)
+	_, err := c.Plan(context.Background(), testDoc(), nil)
+	if err == nil {
+		t.Fatal("与 response_format 无关的 400 应报错")
+	}
+	if stub.calls() != 1 {
+		t.Errorf("不应重试: %d 次调用", stub.calls())
+	}
+}
+
+// TestRejectsResponseFormatClassification pins the narrow matcher: only
+// messages that name the field qualify, so a genuine 400 is not masked.
+func TestRejectsResponseFormatClassification(t *testing.T) {
+	cases := []struct {
+		status int
+		msg    string
+		want   bool
+	}{
+		{400, "unsupported parameter: response_format", true},
+		{400, "response_format is not supported by this model", true},
+		{422, "unknown field json_schema", true},
+		{400, "invalid temperature", false},
+		{401, "invalid api key", false},
+		{500, "internal server error", false},
+		{400, "model not found", false},
+	}
+	for _, c := range cases {
+		err := &rosetta.APIError{StatusCode: c.status, Message: c.msg}
+		if got := rejectsResponseFormat(err); got != c.want {
+			t.Errorf("rejectsResponseFormat(%d, %q) = %v, 期望 %v", c.status, c.msg, got, c.want)
+		}
+	}
+	if rejectsResponseFormat(rosetta.ErrNotSupported) != true {
+		t.Error("ErrNotSupported 应视为不支持结构化输出")
+	}
+	if rejectsResponseFormat(nil) {
+		t.Error("nil 不应视为拒绝")
 	}
 }
 
@@ -484,6 +774,172 @@ func TestParsePlanBindsTitleFromMeta(t *testing.T) {
 	}
 }
 
+// TestParsePlanKeepsSourceTitleWhenMetaProposesAnother is the reported defect:
+// the source already has a title and the model proposed a different one. The
+// document must keep the source title until the user accepts, and the proposal
+// must appear as a review item rather than being silently dropped or printed.
+func TestParsePlanKeepsSourceTitleWhenMetaProposesAnother(t *testing.T) {
+	doc := &docmodel.Document{
+		SourceName: "t.docx",
+		Nodes: []docmodel.Node{
+			{ID: "n0001", Kind: docmodel.KindParagraph, Text: "原稿标题", Order: 0},
+			{ID: "n0002", Kind: docmodel.KindParagraph, Text: "正文。", Order: 1},
+		},
+	}
+	answer := `{
+	  "meta": {"title": "模型改写的标题"},
+	  "elements": [{"role":"title","node_id":"n0001"}],
+	  "sections": [{"id":"s1","title":"事项","level":1,"body_node_ids":["n0002"]}]
+	}`
+	plan, err := ParsePlan(answer, doc)
+	if err != nil {
+		t.Fatalf("ParsePlan: %v", err)
+	}
+	if plan.Meta.Title != "" {
+		t.Errorf("meta.title 应被清空, 实际 %q", plan.Meta.Title)
+	}
+	if len(plan.Edits) != 1 {
+		t.Fatalf("标题建议应保留为校对项, 实际 %+v", plan.Edits)
+	}
+	e := plan.Edits[0]
+	if e.NodeID != "n0001" || e.Before != "原稿标题" || e.After != "模型改写的标题" {
+		t.Errorf("校对项内容错误: %+v", e)
+	}
+	if e.Kind != docmodel.EditHeading {
+		t.Errorf("类型 = %q, 期望 %q", e.Kind, docmodel.EditHeading)
+	}
+	if rep := docmodel.VerifyPlan(doc, plan); !rep.OK() {
+		t.Errorf("应通过校验: %+v", rep.Diagnostics)
+	}
+}
+
+// TestParsePlanDoesNotDuplicateTitles: the reported generated file had a
+// masthead line the source never contained. A source with a title must not
+// acquire 版头 values the model invented.
+func TestParsePlanDropsInventedMasthead(t *testing.T) {
+	doc := &docmodel.Document{
+		SourceName: "t.docx",
+		Nodes: []docmodel.Node{
+			{ID: "n0001", Kind: docmodel.KindParagraph, Text: "关于某事项的公告", Order: 0},
+			{ID: "n0002", Kind: docmodel.KindParagraph, Text: "正文。", Order: 1},
+		},
+	}
+	answer := `{
+	  "meta": {"issuing_org": "某区某局", "doc_number": "某发〔2024〕1号"},
+	  "elements": [{"role":"title","node_id":"n0001"}],
+	  "sections": [{"id":"s1","title":"事项","level":1,"body_node_ids":["n0002"]}]
+	}`
+	plan, err := ParsePlan(answer, doc)
+	if err != nil {
+		t.Fatalf("ParsePlan: %v", err)
+	}
+	if plan.Meta.IssuingOrg != "" || plan.Meta.DocNumber != "" {
+		t.Errorf("原文没有的版头要素不应保留: issuing_org=%q doc_number=%q",
+			plan.Meta.IssuingOrg, plan.Meta.DocNumber)
+	}
+	if len(plan.Notes) == 0 {
+		t.Error("移除模型生成的版头应留下说明")
+	}
+}
+
+// TestParsePlanDropsMastheadTextAlsoInProse: the real upload contained the
+// issuing organ's name inside a body sentence ("递交地址：殷都区文化广电体育
+// 旅游局。") and the model reused it as a masthead. A substring match in the
+// source is not evidence that the author wrote a 版头; only a binding is.
+func TestParsePlanDropsMastheadTextAlsoInProse(t *testing.T) {
+	doc := &docmodel.Document{
+		SourceName: "t.docx",
+		Nodes: []docmodel.Node{
+			{ID: "n0001", Kind: docmodel.KindParagraph, Text: "关于某事项的公告", Order: 0},
+			{ID: "n0002", Kind: docmodel.KindParagraph, Text: "递交地址：殷都区文化广电体育旅游局。", Order: 1},
+		},
+	}
+	answer := `{
+	  "meta": {"issuing_org": "殷都区文化广电体育旅游局"},
+	  "elements": [{"role":"title","node_id":"n0001"}],
+	  "sections": [{"id":"s1","title":"事项","level":1,"body_node_ids":["n0002"]}]
+	}`
+	plan, err := ParsePlan(answer, doc)
+	if err != nil {
+		t.Fatalf("ParsePlan: %v", err)
+	}
+	if plan.Meta.IssuingOrg != "" {
+		t.Errorf("正文里出现过的名称不等于作者写过的版头, 实际保留 %q", plan.Meta.IssuingOrg)
+	}
+}
+
+// The model may leave the source's title paragraph entirely unbound while
+// emitting its own masthead. Previously the masthead survived because the drop
+// depended on a title binding; the source title then fell into a section body
+// and was printed as 正文. Both halves must be fixed at once.
+func TestParsePlanBindsForgottenTitleAndDropsMasthead(t *testing.T) {
+	doc := &docmodel.Document{
+		SourceName: "t.docx",
+		Nodes: []docmodel.Node{
+			{ID: "n0001", Kind: docmodel.KindParagraph, Text: "关于某事项的公告", Order: 0},
+			{ID: "n0002", Kind: docmodel.KindParagraph, Text: "正文。", Order: 1},
+		},
+	}
+	answer := `{
+	  "meta": {"issuing_org": "某区某局"},
+	  "sections": [{"id":"s1","title":"事项","level":1,"body_node_ids":["n0002"]}]
+	}`
+	plan, err := ParsePlan(answer, doc)
+	if err != nil {
+		t.Fatalf("ParsePlan: %v", err)
+	}
+	var title *docmodel.ElementBinding
+	for i := range plan.Elements {
+		if plan.Elements[i].Role == docmodel.RoleTitle {
+			title = &plan.Elements[i]
+		}
+	}
+	if title == nil || title.NodeID != "n0001" {
+		t.Fatalf("应把原稿标题绑定为 title, 实际 %+v", plan.Elements)
+	}
+	if plan.Meta.IssuingOrg != "" {
+		t.Errorf("原文没有的版头应被移除, 实际 %q", plan.Meta.IssuingOrg)
+	}
+	if rep := docmodel.VerifyPlan(doc, plan); !rep.OK() {
+		t.Errorf("应通过校验: %+v", rep.Diagnostics)
+	}
+}
+
+// TestParsePlanBindsRealMastheadParagraph: the opposite of the case above.
+// When the source really does contain a masthead line, it must be preserved
+// as a bound element rather than dropped as invented metadata.
+func TestParsePlanBindsRealMastheadParagraph(t *testing.T) {
+	doc := &docmodel.Document{
+		SourceName: "t.docx",
+		Nodes: []docmodel.Node{
+			{ID: "n0001", Kind: docmodel.KindParagraph, Text: "某某区人民政府文件", Order: 0},
+			{ID: "n0002", Kind: docmodel.KindParagraph, Text: "关于某事项的公告", Order: 1},
+			{ID: "n0003", Kind: docmodel.KindParagraph, Text: "正文。", Order: 2},
+		},
+	}
+	answer := `{
+	  "meta": {"issuing_org": "某某区人民政府文件"},
+	  "elements": [{"role":"title","node_id":"n0002"}],
+	  "sections": [{"id":"s1","title":"事项","level":1,"body_node_ids":["n0003"]}]
+	}`
+	plan, err := ParsePlan(answer, doc)
+	if err != nil {
+		t.Fatalf("ParsePlan: %v", err)
+	}
+	if plan.Meta.IssuingOrg != "" {
+		t.Errorf("绑定到原文段落后应清空 meta: %q", plan.Meta.IssuingOrg)
+	}
+	var bound bool
+	for _, e := range plan.Elements {
+		if e.Role == docmodel.RoleMasthead && e.NodeID == "n0001" {
+			bound = true
+		}
+	}
+	if !bound {
+		t.Errorf("原文确有版头段时应绑定, elements=%+v", plan.Elements)
+	}
+}
+
 // TestParsePlanAdoptsHeadingNodeFromTitle: a section that quotes a source
 // heading verbatim but omits heading_node_id is unambiguous, so it is
 // resolved rather than reported.
@@ -539,11 +995,51 @@ func TestParsePlanFillsTitleFromHeadingNode(t *testing.T) {
 
 // ---------------------------------------------------------------- self-repair
 
-// TestPlanRepairsIncompleteAnswer is the core quality mechanism: when the
-// model drops a paragraph, the specific failure is fed back and the corrected
-// answer is accepted.
-func TestPlanRepairsIncompleteAnswer(t *testing.T) {
+// unknownRefPlanJSON references a node the document does not contain. It is
+// used wherever a test needs a defect the *model* must fix: local repair can
+// drop an invented id, but it cannot invent the paragraph it meant.
+func unknownRefPlanJSON() string {
+	return `{
+	  "sections": [
+	    {"id": "s1", "title": "一、总体要求", "level": 1,
+	     "heading_node_id": "n0001",
+	     "body_node_ids": ["n0002", "n9999"]}
+	  ]
+	}`
+}
+
+// TestPlanRepairsIncompleteAnswerLocally: a dropped paragraph is decidable
+// from the document alone, so it is fixed without spending a model round. That
+// is the whole point — the model's second answer would usually be correct but
+// costs tens of seconds and the user's tokens.
+func TestPlanRepairsIncompleteAnswerLocally(t *testing.T) {
 	stub := newStub(t, incompletePlanJSON(), goodPlanJSON())
+	c := newClient(t, stub.URL)
+
+	plan, err := c.Plan(context.Background(), testDoc(), nil)
+	if err != nil {
+		t.Fatalf("本地修正后应一次通过: %v", err)
+	}
+	if stub.calls() != 1 {
+		t.Fatalf("可本地修正的问题不应再花一轮模型调用, 实际 %d 次", stub.calls())
+	}
+
+	rep := docmodel.VerifyPlan(testDoc(), plan)
+	if !rep.OK() {
+		t.Fatalf("修正后应通过校验: %+v", rep.Diagnostics)
+	}
+	// The repair must be visible: a change the user cannot see is exactly what
+	// this project forbids.
+	joined := strings.Join(plan.Notes, "\n")
+	if !strings.Contains(joined, "n0003") {
+		t.Errorf("补收应记录在 notes 里, 实际: %v", plan.Notes)
+	}
+}
+
+// TestPlanAsksModelWhenLocalRepairCannotFix: an invented node id is not
+// repairable locally, so the failure goes back to the model.
+func TestPlanAsksModelWhenLocalRepairCannotFix(t *testing.T) {
+	stub := newStub(t, unknownRefPlanJSON(), goodPlanJSON())
 	c := newClient(t, stub.URL)
 
 	var stages []Stage
@@ -556,11 +1052,8 @@ func TestPlanRepairsIncompleteAnswer(t *testing.T) {
 	if stub.calls() != 2 {
 		t.Fatalf("应调用模型 2 次, 实际 %d", stub.calls())
 	}
-
-	// The accepted plan must cover everything.
-	rep := docmodel.VerifyPlan(testDoc(), plan)
-	if !rep.OK() {
-		t.Fatalf("最终方案应通过校验: %+v", rep.Diagnostics)
+	if !docmodel.VerifyPlan(testDoc(), plan).OK() {
+		t.Fatalf("最终方案应通过校验")
 	}
 
 	// The repair round must actually tell the model what was wrong.
@@ -570,14 +1063,13 @@ func TestPlanRepairsIncompleteAnswer(t *testing.T) {
 	}
 	last, _ := msgs[len(msgs)-1].(map[string]any)
 	feedback, _ := last["content"].(string)
-	if !strings.Contains(feedback, "n0003") {
-		t.Errorf("反馈应指明漏掉的节点 n0003, 实际:\n%s", feedback)
+	if !strings.Contains(feedback, "n9999") {
+		t.Errorf("反馈应指明无效引用 n9999, 实际:\n%s", feedback)
 	}
-	if !strings.Contains(feedback, "uncovered_content") {
+	if !strings.Contains(feedback, "unknown_ref") {
 		t.Errorf("反馈应包含诊断代码, 实际:\n%s", feedback)
 	}
 
-	// The repair stage must be reported to the user.
 	var sawRepair bool
 	for _, s := range stages {
 		if s.Name == StageRepair {
@@ -613,7 +1105,11 @@ func TestPlanRepairsMalformedAnswer(t *testing.T) {
 // keeps dropping the same node would otherwise consume the user's budget
 // indefinitely.
 func TestPlanGivesUpAfterBoundedRounds(t *testing.T) {
-	stub := newStub(t, incompletePlanJSON()) // always incomplete
+	// An unknown id cannot be repaired locally: the paragraph it names does
+	// not exist, so the model has to answer again. Using a locally-fixable
+	// defect here would let the first pass succeed and never exercise the
+	// bound.
+	stub := newStub(t, unknownRefPlanJSON())
 	c := newClient(t, stub.URL)
 
 	_, err := c.Plan(context.Background(), testDoc(), nil)
@@ -641,8 +1137,8 @@ func TestPlanGivesUpAfterBoundedRounds(t *testing.T) {
 	if pe.Rounds != wantCalls {
 		t.Errorf("Rounds = %d, 期望 %d", pe.Rounds, wantCalls)
 	}
-	// The message must name the missing paragraph so the user can act.
-	if !strings.Contains(err.Error(), "n0003") && !strings.Contains(err.Error(), "未被任何章节收录") {
+	// The message must name the offending reference so the user can act.
+	if !strings.Contains(err.Error(), "n9999") && !strings.Contains(err.Error(), "不存在") {
 		t.Errorf("错误信息应指明问题: %v", err)
 	}
 }
@@ -660,7 +1156,7 @@ func TestRepairFeedbackListsMissingParagraphs(t *testing.T) {
 		t.Fatal("测试前提：该方案应不合格")
 	}
 
-	msg := repairPrompt(report, doc)
+	msg := repairPrompt(report, doc, false)
 	for _, must := range []string{"n0003", "第二段正文", "uncovered_content", "不得改写"} {
 		if !strings.Contains(msg, must) {
 			t.Errorf("修复提示缺少 %q:\n%s", must, msg)
@@ -965,5 +1461,150 @@ func TestStageNamesAreStable(t *testing.T) {
 		if got != expect {
 			t.Errorf("阶段常量 %q 与约定 %q 不符", got, expect)
 		}
+	}
+}
+
+// ---------------------------------------------------------------- id 唯一性
+
+// TestParsePlanAssignsUniqueSectionIDs: the model may omit ids (or repeat
+// them). Numbering each level separately produced a parent and its first child
+// both named "s1", which renders fine but makes every id-addressed client
+// operation land on two chapters at once.
+func TestParsePlanAssignsUniqueSectionIDs(t *testing.T) {
+	doc := testDoc()
+	answer := `{"sections":[{"title":"一、总体要求","level":1,"heading_node_id":"n0001",` +
+		`"body_node_ids":["n0002"],"children":[{"title":"（一）子项","level":2,` +
+		`"body_node_ids":["n0003"]}]}]}`
+	plan, err := ParsePlan(answer, doc)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	seen := map[string]bool{}
+	var walk func([]docmodel.Section)
+	walk = func(list []docmodel.Section) {
+		for _, s := range list {
+			if s.ID == "" {
+				t.Fatal("章节缺少 id")
+			}
+			if seen[s.ID] {
+				t.Errorf("章节 id %q 重复", s.ID)
+			}
+			seen[s.ID] = true
+			walk(s.Children)
+		}
+	}
+	walk(plan.Sections)
+}
+
+// TestParsePlanCanonicalizesSectionIDs: every accepted plan gets preorder ids.
+//
+// This used to preserve ids the model supplied uniquely, on the theory that
+// they were information. In practice the model names sub-sections by its own
+// scheme ("s1a", "s2-3"), so two runs over the same document produced the same
+// tree with different ids — and the review screen keys rows on the id. A
+// canonical preorder is stable for a given tree, unique by construction, and
+// still usable as the address for every client operation.
+func TestParsePlanCanonicalizesSectionIDs(t *testing.T) {
+	doc := testDoc()
+	answer := `{"sections":[` +
+		`{"id":"intro","title":"一、总体要求","level":1,"heading_node_id":"n0001","body_node_ids":["n0002"]},` +
+		`{"id":"intro","title":"二、其他","level":1,"body_node_ids":["n0003"]}]}`
+	plan, err := ParsePlan(answer, doc)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if plan.Sections[0].ID != "s1" || plan.Sections[1].ID != "s2" {
+		t.Errorf("章节 id 应为前序编号 s1/s2, 实际 %q/%q",
+			plan.Sections[0].ID, plan.Sections[1].ID)
+	}
+}
+
+// TestParsePlanNeverCollidesWithLaterID: renumbering must not invent an id that
+// the model already used deeper in the tree.
+func TestParsePlanNeverCollidesWithLaterID(t *testing.T) {
+	doc := testDoc()
+	// First section has no id; a later sibling uses "s1".
+	answer := `{"sections":[` +
+		`{"title":"一、甲","level":1,"heading_node_id":"n0001","body_node_ids":["n0002"]},` +
+		`{"id":"s1","title":"二、乙","level":1,"body_node_ids":["n0003"]}]}`
+	plan, err := ParsePlan(answer, doc)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, s := range plan.Sections {
+		if seen[s.ID] {
+			t.Errorf("id %q 重复：补号与模型已用的 id 撞了", s.ID)
+		}
+		seen[s.ID] = true
+	}
+}
+
+// TestRepairPromptKeepsEditsWhenAllowed: the closing restatement used to say
+// "不得改写任何原文" regardless of mode, contradicting the turn that had just
+// asked the model for declared fixes. Under allowEdits it must instead tell
+// the model to keep them.
+func TestRepairPromptKeepsEditsWhenAllowed(t *testing.T) {
+	doc := testDoc()
+	plan := &docmodel.Plan{Sections: []docmodel.Section{
+		{ID: "s1", Title: "一、总体要求", Level: 1, HeadingNodeID: "n0001", BodyNodeIDs: []string{"n0002"}},
+	}}
+	report := docmodel.VerifyPlan(doc, plan)
+	if report.OK() {
+		t.Fatal("测试前提：该方案应不合格")
+	}
+
+	msg := repairPrompt(report, doc, true)
+	if strings.Contains(msg, "不得改写任何原文") {
+		t.Errorf("allowEdits 时不应再说「不得改写任何原文」:\n%s", msg)
+	}
+	if !strings.Contains(msg, "edits") {
+		t.Errorf("allowEdits 时应要求保留 edits:\n%s", msg)
+	}
+
+	off := repairPrompt(report, doc, false)
+	if !strings.Contains(off, "不得改写任何原文") {
+		t.Errorf("未开启时应保持原有约束:\n%s", off)
+	}
+}
+
+// ---------------------------------------------------------------- 结构摘要
+
+// TestPromptListsUnstyledNumberedHeadings: a .docx whose headings were typed
+// as ordinary paragraphs parses as 正文, so the model has no way to tell a
+// heading from prose. The prompt must point those lines out.
+func TestPromptListsUnstyledNumberedHeadings(t *testing.T) {
+	doc := &docmodel.Document{Nodes: []docmodel.Node{
+		{ID: "n0001", Kind: docmodel.KindParagraph, Text: "一、总体要求"},
+		{ID: "n0002", Kind: docmodel.KindParagraph, Text: "正文。"},
+		{ID: "n0003", Kind: docmodel.KindParagraph, Text: "（一）主要目标"},
+	}}
+	prompt := buildUserPrompt(doc, "", false)
+	for _, must := range []string{"n0001", "n0003", "无标题样式", "heading_node_id"} {
+		if !strings.Contains(prompt, must) {
+			t.Errorf("结构摘要缺少 %q:\n%s", must, prompt)
+		}
+	}
+}
+
+// TestPromptOmitsHintsWithoutHeadings: a document with no structural markers
+// must not get an empty section heading, which would be noise.
+func TestPromptOmitsHintsWithoutHeadings(t *testing.T) {
+	doc := &docmodel.Document{Nodes: []docmodel.Node{
+		{ID: "n0001", Kind: docmodel.KindParagraph, Text: "普通一段话，没有任何编号。"},
+	}}
+	prompt := buildUserPrompt(doc, "", false)
+	if strings.Contains(prompt, "原文自带的层次标题") {
+		t.Errorf("无标题时不应输出结构摘要:\n%s", prompt)
+	}
+}
+
+// TestPromptReportsStyledHeadings: a real Heading style is reported as such, so
+// the model knows the level came from markup rather than from text.
+func TestPromptReportsStyledHeadings(t *testing.T) {
+	doc := testDoc()
+	prompt := buildUserPrompt(doc, "", false)
+	if !strings.Contains(prompt, "标题样式 层级1") {
+		t.Errorf("样标题层级未写进提示词:\n%s", prompt)
 	}
 }

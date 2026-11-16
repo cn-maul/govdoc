@@ -1,134 +1,199 @@
-# GovDoc 前端视觉规范 —— 对齐 HeroUI v3 设计语言
+# GovDoc 前端技术规范 —— React 19 + Tailwind CSS v4 + HeroUI v3
 
-> 来源：本地参考实现 `C:\Users\louis\Desktop\project\heroui-3.2.6`
-> （`packages/styles/themes/default/variables.css`、`components/{button,card,input,typography}.css`、
-> `themes/shared/theme.css`、`base/base.css`）。
->
-> **重要**：HeroUI 本身是 Tailwind v4 组件库，本项目约束是「Vue3 + 自实现 CSS，禁止组件库」。
-> 因此这里做的是**用原生手写 CSS 复刻 HeroUI 的视觉语言**：同一套设计令牌、同样的造型、
-> 同样的动效曲线与阴影层次。**不要把 HeroUI 或 Tailwind 装进项目。**
+> 迁移计划与验收口径见 [PLAN_react-tailwind-heroui.md](PLAN_react-tailwind-heroui.md)。
+> 本文是**迁移后**的规范；旧版「Vue 3 + 手写 CSS，禁止引入组件库」的约束已废止。
 
-## 1. 令牌（tokens.css）—— 直接复制自 HeroUI，勿自行改数值
+## 1. 技术栈与硬约束
 
-完整的可直接使用文件见 `docs/design-tokens.css`。把它复制为 `web/src/styles/tokens.css`。
-关键点：
+| 层 | 选型 |
+| --- | --- |
+| UI 运行时 | React 19（`react` / `react-dom`） |
+| 语言 | TypeScript（`strict`、`noUnusedLocals`、`noUnusedParameters`） |
+| 样式引擎 | Tailwind CSS v4（`@tailwindcss/vite`，无 `tailwind.config.js`） |
+| 组件库 | HeroUI v3（`@heroui/react` + `@heroui/styles`） |
+| 构建 | Vite（`base: './'`、`outDir: 'dist'`、`assetsDir: 'assets'`、`target: 'es2020'`） |
 
-- HeroUI 用 **oklch** 定义颜色、用 **color-mix(in oklab/oklch)** 派生 hover/soft 色。
-  现代浏览器（Chrome 111+/Safari 15.4+/Firefox 113+）均支持，**保持一致即可，不要换算成 hex**，
-  否则 hover 派生色会与参考实现产生可见偏差。
-- 圆角体系由单一 `--radius: 0.5rem` 推导：
-  `--radius-xs .25× --radius-sm .5× --radius-md .75× --radius-lg 1× --radius-xl 1.5× --radius-2xl 2× --radius-3xl 3×`。
-- 表单控件圆角是 **`--radius-field: calc(var(--radius) * 1.5)` = 12px**。
-- 卡片圆角是 **`min(32px, var(--radius-3xl))` = 24px**。
-- 按钮圆角是 **`rounded-3xl` = 24px**，高度 40px（`md` 36px）→ 呈**胶囊形**。这是 HeroUI v3 的显著特征。
-- 输入框**默认无边框**（`--field-border-width: 0px`，`--field-border: transparent`），靠
-  底色 `--field-background` + `--field-shadow` 与背景区分，focus 时才出现 ring。这是最容易做错的地方。
+不可变约束：
 
-## 2. 组件配方（复刻自 HeroUI 实际 CSS）
+- **设计令牌保留在 `web/src/styles/tokens.css`**，仍是 HeroUI v3 默认主题的逐字复制（oklch +
+  `color-mix`），不要换算成 hex，否则 hover/soft 派生色会产生可见偏差。
+- 不引入路由库：仍是单页 + `tab` 状态切换。
+- 不使用 `dangerouslySetInnerHTML`：原文一律按文本渲染。
+- 构建产物落在 `web/dist`，由根目录 `embed.go` 内嵌。
 
-### 按钮 `.gd-btn`
-```
-h-10 / md:h-9 (2.5rem / 2.25rem)   px-4   gap-2
-rounded: 24px (胶囊)   font-size 14px / font-weight 500   white-space nowrap
-transition: transform 250ms var(--ease-smooth),
-            background-color 100ms var(--ease-out),
-            box-shadow 100ms var(--ease-out)
-:hover  → background-color: var(--button-bg-hover)
-:active → background-color: var(--button-bg-pressed); transform: scale(0.97)
-:focus-visible → ring (见 §3)
-:disabled → opacity 0.5; cursor not-allowed
-```
-变体（只改 CSS 变量，与 HeroUI 一致）：
-| 变体 | bg | hover | fg |
-|---|---|---|---|
-| primary | `--accent` | `--accent-hover` | `--accent-foreground` |
-| secondary | `--default` | `--default-hover` | `--accent-soft-foreground` |
-| ghost / outline | transparent | `--default` | `--default-foreground` |
-| danger | `--danger` | `--danger-hover` | `--danger-foreground` |
-| danger-soft | `--danger-soft` | `--danger-soft-hover` | `--danger-soft-foreground` |
-| success | `--success` | `--success-hover` | `--success-foreground` |
+## 2. 样式引入顺序（必须）
 
-尺寸：`sm` h-9/md:h-8 px-3；`lg` h-11/md:h-10 text-16px。active scale：sm 0.98 / md 0.97 / lg 0.96。
-图标按钮：`w-10 md:w-9 p-0`（sm: w-9/md:w-8；lg: w-11/md:w-10）。
+`web/src/styles/index.css` **按需引入 HeroUI 组件样式**，不写 `@import "@heroui/styles"`
+（那是全量 86 个组件，产物 734 kB；按需约 330 kB）。顺序与分层都有意义：
 
-### 卡片 `.gd-card`
-```
-display flex; flex-direction column; gap: 12px; padding: 16px
-border-radius: min(32px, 24px)
-box-shadow: var(--surface-shadow)
-background: var(--surface)
-```
-- 标题 `text-sm(14px) leading-6 font-weight 500 color var(--foreground)`
-- 描述 `text-sm leading-5 color var(--muted)`
-- 变体：`--default` bg surface；`--secondary` bg surface-secondary；`--tertiary` bg surface-tertiary；`--transparent` 无 bg/无 shadow。
+```css
+@layer theme, base, components, utilities;
 
-### 输入框 `.gd-input`
-```
-border-radius: var(--radius-field)  /* 12px */
-padding: 8px 12px
-font-size: 16px (sm 断点以上 14px)
-background: var(--field-background); color: var(--field-foreground)
-box-shadow: var(--field-shadow)
-border-width: 0; border-color: transparent
-transition: background-color 150ms var(--ease-smooth),
-            border-color 150ms var(--ease-smooth),
-            box-shadow 150ms var(--ease-out)
-::placeholder → color var(--field-placeholder)
-:hover:not(:focus) → background var(--field-hover); border-color var(--field-border-hover)
-:focus → background var(--field-focus); border-color var(--field-border-focus); + focus ring
-[data-invalid] → 用 --danger 系 ring
-```
-label `text-sm font-weight 500`；错误文案用 `--danger`。
+@import "tailwindcss";
+@import "@heroui/styles/base" layer(base);
+@import "@heroui/styles/base/scrollbar.css" layer(base);
+@import "@heroui/styles/themes/default" layer(theme);
 
-### 排版 `.gd-prose`
-按 HeroUI typography：`h1 36px/600 tracking-tight`、`h2 30px`、`h3 24px`、`h4 20px`、`h5 18px`、`h6 16px`，
-`p 16px leading-7`，`code` 用 `--default` 底 + 圆角 6px，`a` 用 `--link` 且 `underline-offset-4`。
+/* 共享件在前 */
+@import "@heroui/styles/components/label.css" layer(components);
+/* …按字母/用途逐个组件… */
 
-## 3. 焦点环与禁用态（HeroUI 的 status-* 工具）
+@import "@heroui/styles/utilities";
+@import "@heroui/styles/variants";
 
-```
-:focus-visible {
-  outline: 2px solid var(--focus);        /* --focus = --accent */
-  outline-offset: var(--ring-offset-width); /* 2px */
-}
-[disabled], [aria-disabled="true"] {
-  opacity: var(--disabled-opacity);  /* 0.5 */
-  cursor: var(--cursor-disabled);    /* not-allowed */
-}
+@import "./tokens.css";
+@import "./app.css";
 ```
 
-## 4. 动效
+三条必须守住的规则：
 
-只用 HeroUI 自带的缓动令牌，不要自己写贝塞尔：
-`--ease-smooth: ease`、`--ease-out-fluid: cubic-bezier(0.32,0.72,0,1)`（Apple 式快起慢停，用于抽屉/弹层）、
-`--ease-out-quart/cubic/expo` 等见 `docs/design-tokens.css`。
-**务必**加 `@media (prefers-reduced-motion: reduce) { transition: none }`（HeroUI 用 `motion-reduce:` 表达了同一意图）。
+1. **`@layer theme, base, components, utilities;` 必须保留，且每个组件 import 都要带
+   `layer(components)`。** 少了分层，HeroUI 的组件样式会盖住调用点写的 Tailwind 工具类，
+   连 `text-[13px]` 这种最基本的覆盖都会失效（表格、卡片标题会整体变大一号）。
+   验证方式：同一页面在「全量 CSS」与「按需 CSS」两版下逐个 `[data-slot]` 采样
+   `getComputedStyle`，结果必须完全一致。
+2. **共享件必须排在组件之前**（`label` / `description` / `field-error` / `close-button`）。
+   组件靠后面的规则覆盖共享件的默认值。
+3. **新用到 HeroUI 组件时，要在 `index.css` 补一行 CSS**，否则组件结构对了但没有样式；
+   改完跑一遍逐页截图核对。
 
-## 5. 阴影
+- `tokens.css` 提供 `--background` / `--surface` / `--accent` / `--danger` 等语义变量；
+  HeroUI 组件读的是同一套变量名，因此主题天然一致。
+- `app.css` 只放**工具类难以表达**的结构：A4 纸张缩放（`.gd-paper-stage` / `.gd-paper-scaler` /
+  `.gd-paper-frame`）、`prefers-reduced-motion`、少量文本辅助类。
+
+## 3. 组件使用规范
+
+优先使用 HeroUI v3 的复合组件（`Card.Header` / `Card.Content`、`Alert.Title` / `Alert.Description`、
+`Table.Root` 等），不要凭 v2 记忆写扁平 props —— **以 `node_modules/@heroui/react` 的实际类型声明为准**。
+
+本项目常用入口：
+
+| 用途 | 组件 |
+| --- | --- |
+| 按钮 | `Button`（`variant`: `primary` / `secondary` / `tertiary` / `danger` / `danger-soft` / `outline` / `ghost`；`size`: `sm` / `md` / `lg`） |
+| 单选题组（筛选、缩放、默认规则） | `ToggleButtonGroup`（`selectionMode="single"` + `selectedKeys` / `onSelectionChange`）+ `ToggleButton` |
+| 页内分栏与导航 | `Tabs` + `Tabs.List` / `Tabs.Tab` / `Tabs.Panel`（支持 `orientation="vertical"`） |
+| 需要保留未提交表单的页签 | `Tabs.Panel shouldForceMount` + `className="data-[inert=true]:hidden"`：RAC 默认卸载未选中面板，会清空用户填了一半的输入；force mount 后要自己按 `data-inert` 隐藏，否则两页同时显示 |
+| 折叠块 | `Disclosure` + `Disclosure.Heading` / `Trigger` / `Content` / `Body` |
+| 下拉选择 | `Select` 复合件（`Trigger` / `Value` / `Indicator` / `Popover` + `ListBox`） |
+| 表格 | `Table` + `Table.ScrollContainer` / `Content` / `Header` / `Column` / `Body` / `Row` / `Cell` |
+| 卡片 / 面板 | `Card` + `Card.Header` / `Card.Title` / `Card.Description` / `Card.Content` / `Card.Footer` |
+| 提示条 | `Alert` + `Alert.Indicator` / `Alert.Content` / `Alert.Title` / `Alert.Description` |
+| 轻提示 | `Toast.Provider` + 命令式 `toast(text, { variant, timeout })` |
+| 徽标 | `Chip`（`color`: `default` / `accent` / `success` / `warning` / `danger`） |
+| 复选框 | `Checkbox` + `Checkbox.Content` / `Control` / `Indicator`，说明用 `Description` |
+| 加载 | `Spinner`、`ProgressBar`（`isIndeterminate`） |
+
+通用展示件统一放在 `web/src/ui/primitives.tsx`（见 §3.3），业务组件只从那里取，
+不在各处重复拼装。
+
+**不要手写「看起来像」的控件。** 一排 `aria-pressed` 的按钮不是单选组，读屏器只会念
+「按钮」；手写折叠箭头不带 `aria-expanded`；自己定位的浮层没有焦点陷阱与方向键。
+凡是组件库有对应件，就用组件库的 —— 这不只是省代码，而是键盘、读屏与触屏行为本来就
+不属于本项目的实现范围。
+
+### 3.1 `Btn`：给 HeroUI Button 加 `title` 的包装
+
+HeroUI 的 `Button` 建立在 `react-aria-components` 之上，后者用 `filterDOMProps` 把原生 `title`
+过滤掉了（只放行 `id` / `aria-*` / `data-*` / 全局事件），所以：
+
+- 直接写 `title="…"` **既过不了类型检查，也不会出现在 DOM 上**；
+- 需要提示文案时用 `primitives.tsx` 里的 `Btn`：
+
+```tsx
+<Btn size="sm" variant="ghost" title="上移" isDisabled={i === 0} onPress={...}>↑</Btn>
+```
+
+`Btn` 用一个 `inline-flex` 的 `span` 承接 `title`，其余 props 原样透传。**原生** `<button>` /
+`<span>` / `<option>` 上的 `title` 不受此限制，照常使用。
+
+### 3.3 适配层 `web/src/ui/primitives.tsx`
+
+业务组件只从这里取展示件。这一层存在的理由不是「再包一层」，而是 HeroUI v3 自己不便
+表达的四件事：
+
+| 导出 | 为什么需要 |
+| --- | --- |
+| `Btn` | RAC 的 `filterDOMProps` 会丢掉原生 `title`，而本项目大量按钮靠 title 说明「为什么禁用」。见 §3.1。 |
+| `LinkButton` | 下载 / 新窗口必须是真 `<a>`（中键新标签、右键另存、悬停显 URL），但视觉要与 `Button` 一致。复用 HeroUI 的 `.button` + `.button--{size}` + `.button--{variant}` 类，而不是手写一套 rounded/bg/hover。 |
+| `Select` | 把 `Trigger` / `Popover` / `ListBox` 三件套收成 `value` + `onChange` + `items`；空串显示 placeholder。注意 HeroUI Select 无法用空 key 表示「未选」，需要哨兵值（如设置页的 `AUTO_PROTOCOL = '__auto__'`）。 |
+| `CheckboxField` | 把标签、控件与说明按「说明在 Content 之外」的正确结构摆好，避免说明被读成标签的一部分。 |
+| `IndeterminateProgress` | 不确定进度条，自带 `role="progressbar"` 与 `aria-busy`。 |
+
+其余（`SectionCard` / `AlertBox` / `Badge` / `Field` / `Row` / `Stack` / `EmptyState` /
+`InlineSpinner` / `TextInput` / `TextArea`）都是薄封装，只补默认样式与中文排版间距。
+
+### 3.2 交互事件
+
+- 优先 `onPress`（react-aria 的语义事件，自带键盘/触摸处理）；`onClick` 仅在需要原生事件对象时使用。
+- `v-model.number` 类输入用 `Number(e.target.value)`；其余 `onChange` 直接取 `e.target.value`。
+- 禁用用 `isDisabled`（HeroUI / RAC 组件）或 `disabled`（原生元素），不要混用。
+
+### 3.4 校对工作台：左预览 / 右校正
+
+`PanelReview` 是三栏之外的两栏结构（左侧全局导航仍在外层，此处指主内容区）：
 
 ```
---surface-shadow: 0 2px 4px 0 rgba(0,0,0,.04), 0 1px 2px 0 rgba(0,0,0,.06), 0 0 1px 0 rgba(0,0,0,.06);
---overlay-shadow: 0 2px 8px 0 rgba(0,0,0,.06), 0 -6px 12px 0 rgba(0,0,0,.03), 0 14px 28px 0 rgba(0,0,0,.08);
---field-shadow:   同 surface-shadow
+grid xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]
+├── 左（sticky top-20）：<PreviewPane compact height="clamp(24rem,62vh,46rem)" />
+└── 右：<Tabs defaultSelectedKey="edits">
+        AI 改动 / 结构方案 / 原文节点 / 成文核对
 ```
-暗色主题下 HeroUI 把 shadow 置为 inset/透明，见令牌文件。
 
-## 6. 布局基调
+- **左边必须是成品本身**，不是第二份摘要。用户校对时判断的是「这句话改完长什么样」，
+  如果左栏只是文字列表，他仍然得切到预览页去验证，改一次来回一次。
+- `PreviewPane` 同时被全屏预览页复用 —— 两处看到的必须是同一张纸。
+- 左侧 `xl:sticky`：右栏滚到第 20 条结构变动时，纸还在眼前。
+- 紧凑模式默认缩放 50%：左栏宽约 470px，A4 纸固定 794px，100% 时一张纸要横向滚动才能
+  看全；缩放组仍可点，需要细看时放大即可。
+- 右栏四个 Tab 的分工：`AI 改动` = 文字层面的声明改动 + 结构变动 + 手工补一条；
+  `结构方案` = 章节树与逐节点归属；`原文节点` = 每段原文被谁引用、有没有漏收重复；
+  `成文核对` = 逐字比对结果。它们回答的是四个不同的问题，不要合并。
 
-- 页面底 `--background`（浅灰 oklch(0.9702 0 0)），卡片/面板 `--surface`（纯白）→ 自然的浅灰底 + 白卡层次。
-- 分隔用 `--separator`（oklch 92%），描边用 `--border`（oklch 90%）。
-- 文字层级：主 `--foreground`、次 `--muted`。
+## 4. Tailwind 使用规范
+
+- **布局**：`flex` / `grid` / `gap-*` / `space-y-*` / `max-w-*`；响应式用 `sm`(40rem) / `md`(48rem) /
+  `lg`(64rem) / `xl`(80rem)，对应旧版 640 / 900 / 1100 三档的近似值。
+- **颜色**：优先 Tailwind 语义类（`text-foreground`、`bg-surface`、`bg-surface-secondary`、
+  `border-border`、`text-muted`、`text-danger`、`text-success`、`bg-accent-soft` 等）；
+  令牌里没有的用 `text-[var(--xxx)]` 逃生。
+- **禁止**新增 `.gd-*` 手写组件样式；`components.css` / `layout.css` 已删除。
+- 字体族与正文基础样式在 `app.css` 的 `body` 上一次性设定，不再逐组件声明。
+
+## 5. 焦点环、禁用态与动效
+
+```css
+:focus-visible { outline: 2px solid var(--focus); outline-offset: var(--ring-offset-width); }
+[disabled], [aria-disabled="true"] { opacity: var(--disabled-opacity); cursor: var(--cursor-disabled); }
+```
+
+动效只用令牌里的缓动（`--ease-smooth`、`--ease-out-fluid` 等），并保留
+`@media (prefers-reduced-motion: reduce)` 的全局降级（见 `app.css`）。
+
+## 6. 状态层
+
+- `web/src/store/reactive.ts`：极简深层 `Proxy` + `computed` 兼容层（`get`/`set` 自增版本号）。
+- `web/src/store/govdoc.ts`：模块级单例 `gov`，全部写操作都是导出函数。
+- `web/src/store/useGov.ts`：`useSyncExternalStore(subscribe, getVersion)`；**组件在函数体顶部调用一次**即可订阅。
+- 组件只读 `gov`，写入一律调用 store 导出函数；组件本地状态用 `useState`，本地派生用 `useMemo`，
+  副作用用 `useEffect`（Vue 的 `watch` 改为 `useEffect` + 依赖数组）。
 
 ## 7. 与公文预览的关系（不要混淆）
 
-**应用 UI 用 HeroUI 令牌；公文纸张预览区域必须用 `gbstandard.Spec` 的数值**（A4 210×297mm、
+这里再补一条实现注意：纸张的占位盒按**像素**算（794×1123 × 缩放），不要写成百分比。
+`.gd-paper-scaler` 用 `width: ${794*zoom}px`，容器居中靠 `margin: auto` 而不是
+`justify-content: center` —— 后者在内容比容器宽时会把溢出的那一半推到负坐标，滚动条到不了，
+150% 缩放时纸张左半边就永远看不见。
+
+**应用 UI 用 HeroUI 令牌；公文纸张预览区必须用 `gbstandard.Spec` 的数值**（A4 210×297mm、
 页边距 28/26/37/35mm、正文三号 16pt 仿宋、固定行距 28.99pt）。两者不能混用：
 预览区是「纸」，要严格还原国标；应用外壳是「软件界面」，用 HeroUI 语言。
 预览区应当视觉上明确是「一张纸」（白底、投影、四周留白灰底衬托）。
 
 ## 8. 交付要求
 
-- `web/src/styles/` 拆分：`tokens.css`（§1 令牌）、`base.css`（reset + 焦点环 + 动效偏好）、
-  `components.css`（§2 组件配方）、`layout.css`（页面骨架）。
-- 严禁出现 `@apply`、Tailwind 指令、任何 UI 库 import。
-- 支持 `prefers-color-scheme` 或 `[data-theme="dark"]` 切换（令牌已备好，作为加分项）。
+- 目录结构见 `PLAN_react-tailwind-heroui.md` §4；`src/**/*.vue`、`composables/`、`main.ts`、
+  `env.d.ts`、`styles/{base,components,layout}.css` 均已删除，不要复活。
+- `pnpm typecheck`、`pnpm test`、`pnpm build` 三者必须全绿。
+- 深色主题：令牌已备好，可通过 `[data-theme="dark"]` 切换（加分项，非必需）。

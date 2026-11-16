@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -19,6 +20,8 @@ import (
 // newPersistentRig builds a rig whose settings are written to a temp file, so
 // "does it survive a restart" can be tested by constructing a second server
 // over the same path — which is exactly what a restart is.
+func boolPtr(v bool) *bool { return &v }
+
 func newPersistentRig(t *testing.T, path string) *rig {
 	t.Helper()
 	stub := &stubAnalyzer{}
@@ -330,13 +333,47 @@ func TestAllowEditsReachesAnalyzer(t *testing.T) {
 	}
 }
 
+// TestPreferencesSaveWithoutModelConfigured: 行文方向 and allow_edits live in a
+// separate settings page now. Saving them on a fresh install (no endpoint/key/
+// model yet) must not try to rebuild the model client, which would fail and
+// make the page unusable until the model was configured first.
+func TestPreferencesSaveWithoutModelConfigured(t *testing.T) {
+	r := newRig(t, false)
+	r.srv.SetAnalyzer(&reconfiguringStub{stubAnalyzer: &stubAnalyzer{}})
+
+	dir := gbstandard.DirUp
+	allow := true
+	resp, data := r.do(t, http.MethodPut, "/api/config", api.ConfigRequest{
+		Direction: &dir, AllowEdits: &allow,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("未配置模型时保存偏好应成功，实际 %d: %s", resp.StatusCode, data)
+	}
+	if got := r.srv.EffectiveSpec().Direction; got != dir {
+		t.Errorf("行文方向 = %q, 期望 %q", got, dir)
+	}
+	if !r.srv.currentAllowEdits() {
+		t.Error("allow_edits 应已生效")
+	}
+}
+
+// reconfiguringStub makes the Reconfigure hook reachable, so the test above
+// would fail if preferences triggered it.
+type reconfiguringStub struct {
+	*stubAnalyzer
+}
+
+func (s *reconfiguringStub) Reconfigure(LLMConfig) error {
+	return fmt.Errorf("llm: 未配置模型连接")
+}
+
 // TestAllowEditsDefaultsToSavedPreference: a nil in the request means "use the
 // saved preference", which is what the UI sends when the user has not touched
 // the switch.
 func TestAllowEditsDefaultsToSavedPreference(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "GovDoc", "config.json")
 	st := config.New(path)
-	if err := st.Save(config.File{AllowEdits: true}); err != nil {
+	if err := st.Save(config.File{AllowEdits: boolPtr(true)}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
@@ -363,7 +400,7 @@ func TestAllowEditsDefaultsToSavedPreference(t *testing.T) {
 func TestPerRequestAllowEditsOverridesSaved(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "GovDoc", "config.json")
 	st := config.New(path)
-	if err := st.Save(config.File{AllowEdits: true}); err != nil {
+	if err := st.Save(config.File{AllowEdits: boolPtr(true)}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 

@@ -118,11 +118,48 @@ export interface Section {
   heading_node_id?: string
   /** 本节正文引用的原文节点 id，按输出顺序排列。 */
   body_node_ids?: string[]
+  /**
+   * 本节正文引用的「重组分片」（对应 docmodel.Section.BodyParts）。
+   *
+   * 一个很长的原文段落被声明重组后，会拆成多个分片；每个分片用
+   * `{ node_id, part }` 定位，分别放进不同章节。普通段落仍用 body_node_ids。
+   */
+  body_parts?: BodyPart[]
   /** 为 false 表示模型有意调整了节内顺序。 */
   preserve_order?: boolean
   children?: Section[]
   /** 模型的简短理由，供人工复核。 */
   rationale?: string
+}
+
+/** BodyPart 是重组段落中的一片（对应 docmodel.BodyPart）。 */
+export interface BodyPart {
+  node_id: string
+  /** 分片下标，0 基，对应 plan.recompose 里的 parts 顺序。 */
+  part: number
+  /** 服务端保留字段；正文分片不应设置 role，角色分片由 Recompose.roles 声明。 */
+  role?: string | null
+}
+
+/**
+ * Recompose 是一段原文被改写成多段的显式声明（对应 docmodel.Recompose）。
+ *
+ * 用于原文「一段到底」、没有层次结构的文档：模型可以重建章节，
+ * 但必须把新段落全文写在这里，供用户逐条校对，并在导出时进入改动日志。
+ */
+export interface Recompose {
+  node_id: string
+  /** 改写后的段落，按输出顺序排列。 */
+  parts: string[]
+  /**
+   * 与 parts 等长；空字符串/null 表示普通正文。
+   *
+   * 仅支持 recipient（主送机关）和 preamble（正文前言）。它们必须位于
+   * parts 开头，并且不再放进章节的 body_parts。
+   */
+  roles?: Array<'recipient' | 'preamble' | '' | null>
+  /** 中文理由。 */
+  reason?: string
 }
 
 /**
@@ -186,7 +223,7 @@ export const EDIT_KIND_LABEL: Record<EditKind, string> = {
   wording: '用词不严谨',
   punctuation: '标点',
   sentence_split: '断句',
-  heading: '新增标题',
+  heading: '标题',
   other: '其他修改',
 }
 
@@ -247,6 +284,8 @@ export interface Plan {
    * 仍然是错误（VerifyVerbatim 会抓到），所以没有任何东西能被偷偷改写。
    */
   edits?: Edit[]
+  /** 已声明的整段重组（对应 docmodel.Plan.Recompose）。 */
+  recompose?: Recompose[]
   notes?: string[]
   model?: string
 }
@@ -298,8 +337,22 @@ export interface Report {
   unknown_refs: number
   /** 节内顺序与原文不一致的章节数。 */
   reordered_sections: number
+  /**
+   * 章节之间的顺序与原文不一致的章节数。
+   *
+   * 与 reordered_sections 不同：后者只看一节之内，这里看整篇——把「二、」
+   * 整章放到「一、」前面也一样能通过节内检查。可导出，但会让读者看到
+   * 「二、」排在「一、」之前。
+   */
+  sections_out_of_order?: number
   /** 模型自造标题数。 */
   synthesized_headings: number
+  /** 被声明重组的原文段落数。 */
+  recomposed_nodes?: number
+  /** 重组后产生的段落总数。 */
+  recomposed_parts?: number
+  /** 重组后字数明显少于原文的段落数（需人工确认没有删信息）。 */
+  heavy_recompose?: number
   /** 绑定到公文要素槽位的节点数（对应 docmodel.Report.BoundElements）。 */
   bound_elements: number
 }
@@ -618,6 +671,19 @@ export interface LLMConfig {
   api_key?: string
 }
 
+/** ModelListRequest 探测尚未保存的连接可用的模型。 */
+export interface ModelListRequest {
+  endpoint: string
+  protocol?: string
+  /** 接口地址未变时可省略，服务端复用已保存的 Key。 */
+  api_key?: string
+}
+
+/** ModelListResponse 是接口返回的模型 id 列表。 */
+export interface ModelListResponse {
+  models: string[]
+}
+
 /** ConfigResponse 是完整应用配置。 */
 export interface ConfigResponse {
   llm: LLMConfig
@@ -718,6 +784,14 @@ export interface PlanRequest {
    * 意味着可以「偷偷改写」：模型的每一处修正都必须作为一条 Edit 声明出来。
    */
   allow_edits?: boolean
+  /**
+   * 不调用模型，直接按原文自带的层次序数切出结构。
+   *
+   * 用于没有配置模型、或模型不可用时仍能出一份可用的初稿——前提是原文本来
+   * 就编了号。它不会凭空造标题，因此结果是一份可以手工调整的起点，而不是
+   * "分析结论"。
+   */
+  baseline?: boolean
 }
 
 /** PlanJobResponse 在分析启动时返回，随后客户端跟随 SSE 流。 */
@@ -732,17 +806,97 @@ export interface StageEvent {
   done: boolean
 }
 
+/**
+ * PartialEvent 是模型生成过程中的临时快照。
+ *
+ * 方案尚未完成，也没有通过校验，只能用于“先把已经生成的部分显示出来”。
+ * 最终能否预览和导出，只由终态 DoneEvent 的 report 决定。
+ */
+export interface PartialEvent {
+  plan?: Plan
+  edits?: Edit[]
+  reset?: boolean
+}
+
 /** PlanResponse 让方案与校验结论永远一起传输。 */
+/**
+ * 结构差异中的一处移动。
+ *
+ * 对应 internal/baseline.Move：一段原文在成品里换了归属章节。它是**结构**层面的
+ * 改动日志，与 Edits（文字层面的改动日志）分工相同：VerifyPlan 只保证"没有丢、
+ * 没有重复"，移动本身它看不见。
+ */
+export interface StructureMove {
+  node_id: string
+  /** 原文摘录，供界面直接展示。 */
+  text: string
+  /** moved | to_preamble | from_preamble | to_element */
+  kind: string
+  from: string
+  from_id: string
+  to: string
+  to_id: string
+}
+
+/** 一个章节相对原文结构的增删改名。 */
+export interface SectionChange {
+  /** added | missing | retitled */
+  kind: string
+  id: string
+  title: string
+  baseline_title?: string
+}
+
+/** 一个章节在阅读顺序中的位置变化（1-based）。 */
+export interface SectionMove {
+  id: string
+  title: string
+  baseline_pos: number
+  rendered_pos: number
+}
+
+/**
+ * 方案与「原文自身结构」的差异。
+ *
+ * 基线是**不看模型**、直接按原文自带的层次序数切出来的方案。拿模型方案与它比对，
+ * 就能列出"哪几段换了章节、哪几个章节改了名或换了位置"——这是让结构判断也变成
+ * 可见、可核对的事实，而不是只能靠通读原稿发现。
+ */
+export interface StructureDiff {
+  moves: StructureMove[]
+  sections: SectionChange[]
+  moved_sections: SectionMove[]
+}
+
 export interface PlanResponse {
   plan: Plan | null
   report: Report | null
+  /** 相对原文自身结构的差异；无差异时为空数组。 */
+  structure?: StructureDiff
   job_id?: string
+}
+
+/** ReviseRequest 是工作台对话的一次修改要求。 */
+export interface ReviseRequest {
+  instruction: string
+  /** 用户在预览里选中的文字；为空表示针对整篇。 */
+  selection?: string
+  /** 选中文字来自哪个原文节点（可确定时）。 */
+  node_id?: string
+  allow_edits?: boolean
+}
+
+/** ReviseResponse 是模型给出的待审阅改动与一句回复。 */
+export interface ReviseResponse {
+  edits: Edit[]
+  reply?: string
 }
 
 /** DoneEvent 是终止 SSE 帧。 */
 export interface DoneEvent {
   plan: Plan | null
   report: Report | null
+  structure?: StructureDiff
   error?: string
 }
 

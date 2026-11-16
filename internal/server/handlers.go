@@ -1,17 +1,21 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"path"
 	"strings"
+	"time"
 
 	"govdoc/internal/api"
 	"govdoc/internal/assemble"
+	"govdoc/internal/baseline"
 	"govdoc/internal/config"
 	"govdoc/internal/docmodel"
 	"govdoc/internal/fonts"
@@ -48,6 +52,43 @@ func writeError(w http.ResponseWriter, status int, code, message string, details
 	writeJSON(w, status, api.ErrorBody{Error: api.ErrorDetail{
 		Code: code, Message: message, Details: details,
 	}})
+}
+
+// writePreviewError renders a failure that the browser will show *inside* the
+// preview iframe.
+//
+// /preview is a document URL, not an API call: the user reaches it from an
+// <iframe src> or a "新窗口" link. Answering with the API's JSON error shape
+// means the user sees raw escaped JSON instead of a sentence they can act on
+// (the reported `{"error":{"code":"not_found",...}}`). The JSON contract is
+// unchanged for /api/*, and the status code still carries the machine-readable
+// meaning; only the body is made readable for a person.
+func writePreviewError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// Same restrictive policy as a successful preview: the error page contains
+	// only escaped user-independent text, but keeping one policy avoids a
+	// separate injection surface.
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
+	w.WriteHeader(status)
+	fmt.Fprintf(w, `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>预览不可用</title>
+<style>
+html,body{height:100%%;margin:0}
+body{display:flex;align-items:center;justify-content:center;background:#f6f7f9;color:#1f2328;
+font:14px/1.7 system-ui,"Segoe UI","Microsoft YaHei",sans-serif;padding:24px;box-sizing:border-box}
+.card{max-width:34rem;width:100%%;background:#fff;border:1px solid #e3e6ea;border-radius:16px;
+padding:24px 26px;box-shadow:0 1px 2px rgba(0,0,0,.04),0 12px 32px rgba(0,0,0,.06)}
+h1{margin:0 0 8px;font-size:16px}
+p{margin:0;color:#4a5159;white-space:pre-wrap;word-break:break-word}
+.hint{margin-top:12px;color:#6b7280;font-size:13px}
+</style></head>
+<body><div class="card">
+<h1>预览不可用</h1>
+<p>%s</p>
+<p class="hint">请回到 GovDoc 页面重新分析或重新上传文档。</p>
+</div></body></html>`, html.EscapeString(message))
 }
 
 // statusFor maps a store error to an HTTP status.
@@ -284,6 +325,12 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
+	// Rebuilding the model client is only meaningful when a connection field
+	// changes. Direction and allow_edits are unrelated preferences, and
+	// rebuilding for them would fail on an install that has not configured a
+	// model yet — making "其他设置" unsavable before the model is set up.
+	connectionChanged := req.Endpoint != nil || req.Model != nil ||
+		req.Protocol != nil || req.APIKey != nil
 	if req.Endpoint != nil {
 		s.llm.Endpoint = strings.TrimSpace(*req.Endpoint)
 	}
@@ -327,7 +374,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	// Changing the model connection must reach the analyzer, which owns the
 	// SDK client; otherwise a saved key would only take effect after a
 	// restart, which looks like the save silently failed.
-	if a, ok := s.analyzer.(interface{ Reconfigure(LLMConfig) error }); ok {
+	if a, ok := s.analyzer.(interface{ Reconfigure(LLMConfig) error }); ok && connectionChanged {
 		if err := a.Reconfigure(llm); err != nil {
 			writeError(w, http.StatusBadRequest, api.CodeBadRequest,
 				fmt.Sprintf("模型配置无效：%v", err))
@@ -376,6 +423,78 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 			"（重启后需要重新填写）"
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleListModels probes the model catalog of a connection the user is still
+// editing. POST is used rather than GET so a temporary API key never lands in
+// a URL, and therefore never in server or proxy access logs.
+func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
+	var req api.ModelListRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+
+	endpoint := strings.TrimSpace(req.Endpoint)
+	if endpoint == "" {
+		writeError(w, http.StatusBadRequest, api.CodeBadRequest, "请先填写接口地址。")
+		return
+	}
+	protocol := strings.TrimSpace(req.Protocol)
+	switch protocol {
+	case "", "openai-chat", "openai-responses", "anthropic":
+	default:
+		writeError(w, http.StatusBadRequest, api.CodeBadRequest,
+			fmt.Sprintf("不支持的协议 %q，可选：openai-chat、openai-responses、anthropic", protocol))
+		return
+	}
+
+	current := s.currentLLM()
+	key := strings.TrimSpace(req.APIKey)
+	// A saved key belongs to the saved endpoint. Reusing it after the user
+	// changes the address would send the credential to a host it was never
+	// meant for, so a new address requires the key to be entered again.
+	if key == "" && sameEndpoint(current.Endpoint, endpoint) {
+		key = strings.TrimSpace(current.APIKey)
+	}
+	if key == "" {
+		writeError(w, http.StatusBadRequest, api.CodeBadRequest,
+			"请先填写 API Key；已保存的 Key 只在接口地址未改变时复用。")
+		return
+	}
+
+	s.mu.RLock()
+	lister, ok := s.analyzer.(ModelLister)
+	s.mu.RUnlock()
+	if !ok {
+		writeError(w, http.StatusNotImplemented, api.CodeInternal,
+			"当前运行环境不支持获取模型列表。")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	models, err := lister.ListModels(ctx, LLMConfig{
+		Endpoint: endpoint,
+		APIKey:   key,
+		Protocol: protocol,
+		Timeout:  current.Timeout,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, api.CodeUpstream,
+			fmt.Sprintf("获取模型列表失败：%v", err))
+		return
+	}
+	if models == nil {
+		models = []string{}
+	}
+	writeJSON(w, http.StatusOK, api.ModelListResponse{Models: models})
+}
+
+// sameEndpoint compares connection addresses without trailing slashes, which
+// are insignificant here and are a common copy/paste difference.
+func sameEndpoint(a, b string) bool {
+	return strings.TrimRight(strings.TrimSpace(a), "/") ==
+		strings.TrimRight(strings.TrimSpace(b), "/")
 }
 
 func (s *Server) handleSpec(w http.ResponseWriter, r *http.Request) {
@@ -551,6 +670,23 @@ func (s *Server) handleStartPlan(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// A structure derived from the document itself needs no model, so it is
+	// served before the configured() gate. Otherwise a user with no API key
+	// could not produce anything at all, even from a document that already
+	// numbers its own chapters.
+	if req.Baseline {
+		plan := baseline.Build(sess.Doc)
+		report := docmodel.VerifyPlan(sess.Doc, plan)
+		_, _ = s.store.UpdateSession(sess.ID, func(sess *store.Session) {
+			sess.Plan, sess.Report = plan, report
+		})
+		jobID := newID()
+		job := s.store.NewJob(jobID, sess.ID)
+		job.Finish(plan, report, nil)
+		writeJSON(w, http.StatusAccepted, api.PlanJobResponse{JobID: jobID})
+		return
+	}
+
 	cfg := s.currentLLM()
 	if !cfg.configured() {
 		writeError(w, http.StatusBadRequest, api.CodeNoLLMConfig,
@@ -626,11 +762,16 @@ func (s *Server) runAnalysis(job *store.Job, sess *store.Session, analyzer Analy
 	progress := func(p Progress) {
 		job.Publish(store.StageUpdate{Name: p.Name, Message: p.Message, Done: p.Done})
 	}
+	partial := func(p PartialProgress) {
+		job.Publish(store.StageUpdate{
+			Kind: "partial", Plan: p.Plan, Edits: p.Edits, Reset: p.Reset,
+		})
+	}
 
 	ctx, cancel := analysisContext()
 	defer cancel()
 
-	plan, err := analyzer.Analyze(ctx, sess.Doc, opts, progress)
+	plan, err := analyzer.Analyze(ctx, sess.Doc, opts, progress, partial)
 	if err != nil {
 		// A partial plan is still useful: the failure may have come from the
 		// self-repair loop giving up, in which case showing the user what the
@@ -674,7 +815,11 @@ func (s *Server) handleGetPlan(w http.ResponseWriter, r *http.Request) {
 			"该文档尚未生成结构方案。")
 		return
 	}
-	writeJSON(w, http.StatusOK, api.PlanResponse{Plan: sess.Plan, Report: sess.Report})
+	writeJSON(w, http.StatusOK, api.PlanResponse{
+		Plan:      sess.Plan,
+		Report:    sess.Report,
+		Structure: baseline.Compare(sess.Doc, baseline.Build(sess.Doc), sess.Plan),
+	})
 }
 
 // handlePutPlan stores a user-edited plan and returns a fresh verdict.
@@ -700,7 +845,112 @@ func (s *Server) handlePutPlan(w http.ResponseWriter, r *http.Request) {
 		sess.Plan, sess.Report = &plan, report
 	})
 
-	writeJSON(w, http.StatusOK, api.PlanResponse{Plan: &plan, Report: report})
+	writeJSON(w, http.StatusOK, api.PlanResponse{
+		Plan: &plan, Report: report,
+		Structure: baseline.Compare(sess.Doc, baseline.Build(sess.Doc), &plan),
+	})
+}
+
+// handleRevise turns one chat instruction into declared edits.
+//
+// It never changes the stored plan. The user accepts or rejects each edit in
+// the review list, which is what makes "同意就覆盖、不同意就不覆盖" literally
+// true: the preview and the export only change when PUT /plan carries the
+// accepted edit.
+func (s *Server) handleRevise(w http.ResponseWriter, r *http.Request) {
+	sess, err := s.store.Session(r.PathValue("id"))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if sess.Doc == nil {
+		writeError(w, http.StatusBadRequest, api.CodeBadRequest, "文档内容不可用。")
+		return
+	}
+
+	var req api.ReviseRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.Instruction) == "" {
+		writeError(w, http.StatusBadRequest, api.CodeBadRequest, "请输入修改要求。")
+		return
+	}
+	if req.NodeID != "" {
+		if _, ok := sess.Doc.Node(req.NodeID); !ok {
+			writeError(w, http.StatusBadRequest, api.CodeBadRequest,
+				fmt.Sprintf("选中的段落 %q 不存在。", req.NodeID))
+			return
+		}
+	}
+
+	cfg := s.currentLLM()
+	if !cfg.configured() {
+		writeError(w, http.StatusBadRequest, api.CodeNoLLMConfig,
+			"尚未配置模型连接：请先填写接口地址、模型名称与 API Key。")
+		return
+	}
+
+	s.mu.RLock()
+	reviser, ok := s.analyzer.(Reviser)
+	s.mu.RUnlock()
+	if !ok {
+		writeError(w, http.StatusNotImplemented, api.CodeInternal,
+			"当前运行环境不支持对话修改。")
+		return
+	}
+
+	allowEdits := s.currentAllowEdits()
+	if req.AllowEdits != nil {
+		allowEdits = *req.AllowEdits
+	}
+	if !allowEdits {
+		writeError(w, http.StatusBadRequest, api.CodeBadRequest,
+			"当前设置不允许修改原文。请先在「其他设置」中允许模型修正文字。")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+
+	res, err := reviser.Revise(ctx, sess.Doc, RevisionRequest{
+		Instruction: strings.TrimSpace(req.Instruction),
+		Selection:   req.Selection,
+		NodeID:      req.NodeID,
+		AllowEdits:  allowEdits,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, api.CodeUpstream,
+			fmt.Sprintf("对话修改失败：%v", err))
+		return
+	}
+
+	// Guard the invariant the rest of the program depends on: every edit must
+	// name a real node and a Before that occurs in it. A paraphrased target
+	// would create a review item that can never take effect.
+	valid := make([]docmodel.Edit, 0, len(res.Edits))
+	for _, e := range res.Edits {
+		if strings.TrimSpace(e.NodeID) == "" || strings.TrimSpace(e.Before) == "" {
+			continue
+		}
+		node, ok := sess.Doc.Node(e.NodeID)
+		if !ok {
+			continue
+		}
+		if req.NodeID != "" && e.NodeID != req.NodeID {
+			continue
+		}
+		if !strings.Contains(node.Text, e.Before) {
+			continue
+		}
+		valid = append(valid, e)
+	}
+	if len(res.Edits) > 0 && len(valid) == 0 {
+		writeError(w, http.StatusBadGateway, api.CodeUpstream,
+			"模型提出的改动无法对应到原文，未添加到校对项。请换一种说法再试。")
+		return
+	}
+	writeJSON(w, http.StatusOK, api.ReviseResponse{Edits: valid, Reply: res.Reply})
 }
 
 // ---------------------------------------------------------------- render
@@ -823,11 +1073,19 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	sess, err := s.store.Session(r.PathValue("id"))
 	if err != nil {
-		writeStoreError(w, err)
+		// 这条分支通常就是「服务重启后旧标签页还开着」：文档已不在内存里。
+		// 它同样需要一个可读页面，而不是无法操作的 JSON。
+		if errors.Is(err, store.ErrNotFound) {
+			writePreviewError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writePreviewError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if sess.Plan == nil {
-		writeError(w, http.StatusNotFound, api.CodeNotFound, "该文档尚未生成结构方案。")
+		// 预览是直接在 iframe 里打开的，返回 JSON 会让用户看到一屏转义字符。
+		// 这里给出可读的 HTML，并将状态码保持为 404（语义仍是「还没有方案」）。
+		writePreviewError(w, http.StatusNotFound, "该文档尚未生成结构方案。")
 		return
 	}
 
@@ -841,13 +1099,13 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 
 	res, err := assemble.Build(sess.Doc, sess.Plan, spec)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, api.CodeInvalidPlan,
+		writePreviewError(w, http.StatusBadRequest,
 			fmt.Sprintf("结构方案未通过校验，无法预览：%v", err))
 		return
 	}
 	html, err := preview.Render(res.Doc, spec)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, api.CodeRenderFailed,
+		writePreviewError(w, http.StatusInternalServerError,
 			fmt.Sprintf("生成预览失败：%v", err))
 		return
 	}

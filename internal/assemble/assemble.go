@@ -90,11 +90,12 @@ func Build(doc *docmodel.Document, plan *docmodel.Plan, spec gbstandard.Spec) (*
 	}
 
 	a := &assembler{
-		doc:   doc,
-		plan:  plan,
-		spec:  spec,
-		used:  map[string]bool{},
-		bound: map[docmodel.Role]string{},
+		doc:          doc,
+		plan:         plan,
+		spec:         spec,
+		used:         map[string]bool{},
+		bound:        map[docmodel.Role]string{},
+		emittedParts: map[string]map[int]bool{},
 	}
 	for _, e := range plan.Elements {
 		if _, dup := a.bound[e.Role]; !dup {
@@ -158,6 +159,9 @@ type assembler struct {
 	// failedEdits collects declared edits whose Before text was not found, so
 	// Build can report them instead of letting them vanish.
 	failedEdits []docmodel.UnappliedEdit
+	// emittedParts records which recomposed parts have been placed, so a part
+	// cannot be printed twice even if the plan claims it twice.
+	emittedParts map[string]map[int]bool
 }
 
 // nodeText returns a source node's text with its declared edits applied.
@@ -234,10 +238,88 @@ func (a *assembler) emit(role docmodel.Role, nodeID string, opts ...blockOpt) {
 		b.Edited = true
 		b.EditKinds = append(b.EditKinds, string(ed.Kind))
 	}
+	// The source's inline runs spell the source text. Once a declared edit has
+	// changed that text they no longer do, and a renderer that prefers runs
+	// (the DOCX writer, to preserve bold/italic) would print the pre-edit
+	// wording — exactly the "同意后标题没有变" defect. Dropping them is the
+	// honest choice: the edit's new text has no source span structure to keep,
+	// and printing the wrong characters would be far worse than losing a bold
+	// span inside a corrected line.
+	if b.Edited && len(b.Runs) > 0 && !runsMatchText(b.Runs, b.Text) {
+		b.Runs = nil
+	}
 	for _, o := range opts {
 		o(&b)
 	}
 	a.blocks = append(a.blocks, b)
+}
+
+// emitRecomposedPart appends one declared paragraph of a recomposed source
+// node.
+//
+// The text comes from the plan's declaration, not from the model's free
+// output: VerifyVerbatim requires the emitted part to equal the declared part
+// exactly, so the declaration is the authority. The source node id is carried
+// on the block so the preview can mark the paragraph and the change log can
+// point back at the paragraph it replaced.
+func (a *assembler) emitRecomposedPart(role docmodel.Role, nodeID string, part int, rec docmodel.Recompose) {
+	text, ok := rec.PartText(part)
+	if !ok {
+		return
+	}
+	a.used[nodeID] = true
+	if a.emittedParts[nodeID] == nil {
+		a.emittedParts[nodeID] = map[int]bool{}
+	}
+	a.emittedParts[nodeID][part] = true
+
+	b := docmodel.OutBlock{
+		Role:   role,
+		Text:   text,
+		NodeID: nodeID,
+		Edited: true,
+	}
+	b.EditKinds = []string{"recompose"}
+	a.blocks = append(a.blocks, b)
+}
+
+// emitRecomposeRole emits the declared role parts in declaration order and
+// reports whether it found any. The caller uses that to decide whether an
+// element-slot fallback still applies.
+//
+// The emission order is fixed by the document skeleton: 主送机关, then
+// 前言, then chapters. VerifyPlan already guarantees role parts are a prefix
+// of Parts (recipient first), so walking recompose declarations in plan order
+// and parts ascending reproduces the declaration exactly. That matters because
+// VerifyVerbatim compares output parts with rec.Parts by index.
+func (a *assembler) emitRecomposeRole(role docmodel.Role, roleName string) bool {
+	found := false
+	for _, rec := range a.plan.Recompose {
+		if len(rec.Roles) != len(rec.Parts) {
+			continue
+		}
+		for part, declared := range rec.Roles {
+			if declared != roleName {
+				continue
+			}
+			found = true
+			if a.emittedParts[rec.NodeID] != nil && a.emittedParts[rec.NodeID][part] {
+				continue
+			}
+			a.emitRecomposedPart(role, rec.NodeID, part, rec)
+		}
+	}
+	return found
+}
+
+// runsMatchText reports whether preserved source runs still concatenate to the
+// block's text.
+func runsMatchText(runs []docmodel.Run, text string) bool {
+	var joined strings.Builder
+	for _, r := range runs {
+		joined.WriteString(r.Text)
+	}
+	return joined.String() == text
 }
 
 // emitSynth appends a block whose text this package generated. Every string
@@ -377,11 +459,22 @@ func (a *assembler) buildBody() {
 		a.emitSynth(docmodel.RoleTitle, strings.TrimSpace(a.plan.Meta.Title))
 	}
 
-	if id, ok := a.bound[docmodel.RoleRecipient]; ok && !a.used[id] {
-		a.emit(docmodel.RoleRecipient, id)
-	} else if strings.TrimSpace(a.plan.Meta.Recipient) != "" {
-		a.emitSynth(docmodel.RoleRecipient, strings.TrimSpace(a.plan.Meta.Recipient))
+	// A recomposition may have split a single source paragraph into
+	// 主送机关 + 前言 + body. Its role parts are emitted in the skeleton
+	// slots, in the same order as rec.Parts; VerifyPlan guarantees the role
+	// parts are a prefix of Parts and that no element binding competes for
+	// the same slot.
+	recipientFromParts := a.emitRecomposeRole(
+		docmodel.RoleRecipient, docmodel.RecomposeRoleRecipient)
+	if !recipientFromParts {
+		if id, ok := a.bound[docmodel.RoleRecipient]; ok && !a.used[id] {
+			a.emit(docmodel.RoleRecipient, id)
+		} else if strings.TrimSpace(a.plan.Meta.Recipient) != "" {
+			a.emitSynth(docmodel.RoleRecipient, strings.TrimSpace(a.plan.Meta.Recipient))
+		}
 	}
+
+	a.emitRecomposeRole(docmodel.RoleBody, docmodel.RecomposeRolePreamble)
 
 	// 前言: body prose that sits directly under 主送机关, before the first
 	// 层次序数 heading. It is emitted as unnumbered 正文 paragraphs — the
@@ -537,6 +630,21 @@ func (a *assembler) emitSection(s *docmodel.Section, depth int) {
 		default:
 			a.emit(docmodel.RoleBody, id)
 		}
+	}
+
+	// Recomposed paragraphs are emitted in the order the plan lists them.
+	// VerifyPlan has already rejected a body_parts entry without a matching
+	// declaration, so a missing declaration here can only mean a hand-built
+	// plan skipped verification; skipping is safer than inventing text.
+	for _, bp := range s.BodyParts {
+		rec, ok := a.plan.RecomposeFor(bp.NodeID)
+		if !ok {
+			continue
+		}
+		if a.emittedParts[bp.NodeID] != nil && a.emittedParts[bp.NodeID][bp.Part] {
+			continue
+		}
+		a.emitRecomposedPart(docmodel.RoleBody, bp.NodeID, bp.Part, rec)
 	}
 
 	for i := range s.Children {

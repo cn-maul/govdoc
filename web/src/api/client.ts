@@ -14,6 +14,8 @@ import type {
   ErrorBody,
   ErrorDetail,
   Health,
+  ModelListRequest,
+  ModelListResponse,
   PlanRequest,
   PlanJobResponse,
   PlanResponse,
@@ -22,6 +24,8 @@ import type {
   ProfilesResponse,
   RenderRequest,
   RenderResponse,
+  ReviseRequest,
+  ReviseResponse,
   SpecResponse,
   UploadResponse,
 } from './types'
@@ -169,6 +173,16 @@ export const api = {
 
   putConfig(req: ConfigRequest): Promise<ConfigResponse> {
     return request<ConfigResponse>('config', { method: 'PUT', json: req })
+  },
+
+  /** 探测当前填写的接口地址可用哪些模型，不落盘。 */
+  listModels(req: ModelListRequest): Promise<ModelListResponse> {
+    return request<ModelListResponse>('llm/models', { method: 'POST', json: req })
+  },
+
+  /** 把一句修改要求变成待审阅的改动；不会直接修改方案。 */
+  revise(docId: string, req: ReviseRequest): Promise<ReviseResponse> {
+    return request<ReviseResponse>(`documents/${docId}/revise`, { method: 'POST', json: req })
   },
 
   getSpec(signal?: AbortSignal): Promise<SpecResponse> {

@@ -366,7 +366,12 @@ func (r *render) paragraphXML(blk docmodel.OutBlock, st gbstandard.ParaStyle) st
 	if blk.AutoNumber != "" {
 		b.WriteString(r.run(st, blk.AutoNumber, false, false))
 	}
-	if len(blk.Runs) > 0 {
+	// Inline runs preserve the source's bold/italic spans, but they are only
+	// valid while they still spell the block's text. A declared edit changes
+	// Text and leaves Runs as the source's spans; emitting those runs would
+	// silently print the pre-edit text. The preview already guards with the
+	// same comparison, so the two renderers agree on what is printed.
+	if len(blk.Runs) > 0 && runsMatchText(blk.Runs, blk.Text) {
 		for _, run := range blk.Runs {
 			b.WriteString(r.run(st, run.Text, run.Bold, run.Italic))
 		}
@@ -375,6 +380,17 @@ func (r *render) paragraphXML(blk docmodel.OutBlock, st gbstandard.ParaStyle) st
 	}
 	b.WriteString("</w:p>")
 	return b.String()
+}
+
+// runsMatchText reports whether the preserved source runs still concatenate to
+// the block's current text. An edit invalidates them; using the edited Text is
+// then the only faithful output.
+func runsMatchText(runs []docmodel.Run, text string) bool {
+	var joined strings.Builder
+	for _, run := range runs {
+		joined.WriteString(run.Text)
+	}
+	return joined.String() == text
 }
 
 // ---------------------------------------------------------------- tables

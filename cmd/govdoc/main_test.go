@@ -63,7 +63,7 @@ func TestAnalyzerAdapterForwardsHint(t *testing.T) {
 
 	// An empty section list is rejected by the client and retried, so the call
 	// returns an error; the request itself is what this test inspects.
-	_, _ = adapter.Analyze(t.Context(), doc, server.AnalysisOptions{Hint: hint}, nil)
+	_, _ = adapter.Analyze(t.Context(), doc, server.AnalysisOptions{Hint: hint}, nil, nil)
 
 	if len(bodies) == 0 {
 		t.Fatal("适配器未向模型发出请求")
@@ -98,7 +98,7 @@ func TestAnalyzerAdapterOmitsEmptyHint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newAnalyzer: %v", err)
 	}
-	_, _ = adapter.Analyze(t.Context(), testDocument(), server.AnalysisOptions{}, nil)
+	_, _ = adapter.Analyze(t.Context(), testDocument(), server.AnalysisOptions{}, nil, nil)
 
 	if strings.Contains(body, "用户提示") {
 		t.Errorf("无提示时不应出现提示块:\n%s", body)
@@ -112,7 +112,7 @@ func TestAnalyzerAdapterWithoutConfigReportsNotConfigured(t *testing.T) {
 	if err != nil {
 		t.Fatalf("未配置不应导致构造失败（用户可能随后在界面填写）: %v", err)
 	}
-	if _, err := adapter.Analyze(t.Context(), testDocument(), server.AnalysisOptions{}, nil); err == nil {
+	if _, err := adapter.Analyze(t.Context(), testDocument(), server.AnalysisOptions{}, nil, nil); err == nil {
 		t.Fatal("未配置时应返回错误")
 	}
 }
@@ -144,7 +144,7 @@ func TestAnalyzerAdapterReconfigureAppliesNewEndpoint(t *testing.T) {
 		t.Fatalf("Reconfigure: %v", err)
 	}
 
-	_, _ = adapter.Analyze(t.Context(), testDocument(), server.AnalysisOptions{}, nil)
+	_, _ = adapter.Analyze(t.Context(), testDocument(), server.AnalysisOptions{}, nil, nil)
 	select {
 	case path := <-hit:
 		if !strings.Contains(path, "chat/completions") {

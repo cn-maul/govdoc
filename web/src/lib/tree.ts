@@ -16,6 +16,7 @@ export function cloneSections(sections: Section[]): Section[] {
   return sections.map((s) => ({
     ...s,
     body_node_ids: s.body_node_ids ? [...s.body_node_ids] : undefined,
+    body_parts: s.body_parts?.map((bp) => ({ ...bp })),
     children: s.children ? cloneSections(s.children) : undefined,
   }))
 }
@@ -37,6 +38,11 @@ export function clonePlan(plan: Plan): Plan {
     preamble_node_ids: plan.preamble_node_ids ? [...plan.preamble_node_ids] : undefined,
     sections: cloneSections(plan.sections),
     edits: plan.edits?.map((e) => ({ ...e })),
+    recompose: plan.recompose?.map((r) => ({
+      ...r,
+      parts: [...r.parts],
+      roles: r.roles ? [...r.roles] : undefined,
+    })),
     notes: plan.notes ? [...plan.notes] : undefined,
   }
 }

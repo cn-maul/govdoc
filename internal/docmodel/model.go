@@ -181,6 +181,17 @@ type Section struct {
 	// section's body, in the order they must be emitted. When
 	// PreserveOrder is true these must ascend in source order.
 	BodyNodeIDs []string `json:"body_node_ids,omitempty"`
+	// BodyParts places individual paragraphs of a recomposed source node.
+	//
+	// A source paragraph is one addressable Node, but a long, unstructured
+	// paragraph may need to become several paragraphs in several chapters.
+	// BodyNodeIDs cannot express that: listing the same node twice is a
+	// duplicate claim, and moving the whole node would put all of its text in
+	// one section. BodyParts therefore names (node, part) pairs, where the
+	// parts are declared by Plan.Recompose. Every part must be claimed exactly
+	// once across the tree, and the original node is counted as covered only
+	// when all of its parts are placed.
+	BodyParts []BodyPart `json:"body_parts,omitempty"`
 	// PreserveOrder is false only when the model deliberately reordered
 	// paragraphs inside the section. VerifyPlan still accepts it, but flags
 	// it so the user can see that the text sequence changed.
@@ -191,6 +202,76 @@ type Section struct {
 	// a reviewer can judge the restructuring.
 	Rationale string `json:"rationale,omitempty"`
 }
+
+// BodyPart is one emitted paragraph of a recomposed source node.
+type BodyPart struct {
+	// NodeID is the source node the text came from.
+	NodeID string `json:"node_id"`
+	// Part is the 0-based index into Plan.Recompose[].Parts.
+	Part int `json:"part"`
+	// Role is empty for ordinary body text. Role is not used for element
+	// slots: those are assigned once, at the Recompose level, through Roles.
+	Role string `json:"role,omitempty"`
+}
+
+// Recompose is an explicit declaration that one source paragraph has been
+// rewritten into a sequence of paragraphs.
+//
+// # Why this is a separate declaration rather than an Edit
+//
+// An Edit replaces a substring inside a node, which is the right shape for a
+// typo. A structureless document is a different problem: one long paragraph
+// may need to become several paragraphs, each with its own place in a newly
+// created chapter tree. Splitting a node at newlines alone would preserve the
+// text, but it cannot reorganise the prose enough to make a run-on document
+// readable.
+//
+// Recompose is the user-visible, auditable form of that operation:
+//
+//   - it names the exact source node;
+//   - it carries every output paragraph;
+//   - it carries a Chinese reason;
+//   - the assembler emits only these declared parts, never prose it invented
+//     on its own;
+//   - VerifyVerbatim compares the emitted parts with this declaration and the
+//     export change log lists the whole before/after.
+//
+// The prompt forbids adding facts, figures, dates, organisations or
+// obligations that are not in the source. That is a semantic constraint the
+// checker cannot prove, but the declaration makes the model's decision
+// inspectable instead of hiding it inside a silent rewrite.
+type Recompose struct {
+	NodeID string `json:"node_id"`
+	// Parts are the replacement paragraphs, in output order.
+	Parts []string `json:"parts"`
+	// Roles optionally assigns a non-body slot to a part, aligned with Parts.
+	// Empty strings mean ordinary body text.
+	//
+	// The supported slots are deliberately narrow:
+	//
+	//   - "recipient" — the 主送机关, e.g. "各有关单位：";
+	//   - "preamble"  — the unnumbered 正文 paragraph directly under it, e.g.
+	//     "为做好……现通知如下。".
+	//
+	// Both are emitted before the section tree, so non-empty roles must form
+	// a prefix of Parts, with recipient before preamble. A role part is
+	// claimed by the declaration itself and must NOT also appear in
+	// Section.BodyParts; ordinary parts are placed there exactly once.
+	//
+	// A source 标题 is never expressed here. It must be bound through
+	// Plan.Elements with role "title", so the original wording is preserved.
+	Roles []string `json:"roles,omitempty"`
+	// Reason explains why the paragraph was split/reorganised.
+	Reason string `json:"reason,omitempty"`
+}
+
+const (
+	// RecomposeRoleRecipient marks a part that belongs in 主送机关.
+	RecomposeRoleRecipient = "recipient"
+	// RecomposeRolePreamble marks a part that belongs in the unnumbered
+	// 正文 preamble, directly under 主送机关 and before the first chapter.
+	RecomposeRolePreamble = "preamble"
+)
 
 // Meta is document-level metadata. Every field is optional; the assembler
 // only emits the parts the user (or the model) actually supplied.
@@ -273,6 +354,11 @@ type Plan struct {
 	// before/after and reason, which the UI shows as a diff and the export
 	// reports in a change log.
 	Edits []Edit `json:"edits,omitempty"`
+	// Recompose declares source paragraphs that the model rewrote as several
+	// paragraphs. Each declaration must be placed, part by part, through
+	// Section.BodyParts; a recomposed node may not also appear in
+	// BodyNodeIDs, PreambleNodeIDs or Elements.
+	Recompose []Recompose `json:"recompose,omitempty"`
 	// Notes are model observations shown to the user (ambiguities,
 	// dropped boilerplate, low-confidence decisions).
 	Notes []string `json:"notes,omitempty"`
@@ -326,7 +412,7 @@ func EditLabel(k EditKind) string {
 	case EditSentenceSplit:
 		return "断句"
 	case EditHeading:
-		return "新增标题"
+		return "标题"
 	default:
 		return "其他修改"
 	}
@@ -385,6 +471,27 @@ func (p *Plan) EditsFor(nodeID string) []Edit {
 		}
 	}
 	return out
+}
+
+// RecomposeFor returns the recomposition declared for one node, if any.
+func (p *Plan) RecomposeFor(nodeID string) (Recompose, bool) {
+	if p == nil || nodeID == "" {
+		return Recompose{}, false
+	}
+	for _, r := range p.Recompose {
+		if r.NodeID == nodeID {
+			return r, true
+		}
+	}
+	return Recompose{}, false
+}
+
+// PartText returns the text of one recomposed part.
+func (r Recompose) PartText(part int) (string, bool) {
+	if part < 0 || part >= len(r.Parts) {
+		return "", false
+	}
+	return r.Parts[part], true
 }
 
 // AppliedText returns a node's text with that node's edits applied, plus the
@@ -491,6 +598,9 @@ func (p *Plan) BodyIDs() []string {
 	var out []string
 	p.Walk(func(s *Section) bool {
 		out = append(out, s.BodyNodeIDs...)
+		for _, bp := range s.BodyParts {
+			out = append(out, bp.NodeID)
+		}
 		return true
 	})
 	return out

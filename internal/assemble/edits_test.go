@@ -421,3 +421,54 @@ func TestBuildEditDoesNotTouchNumbering(t *testing.T) {
 		t.Errorf("原标题序数应保留: %q", heading.Text)
 	}
 }
+
+// TestBuildEditClearsStaleRuns: a source block carries its inline runs. When a
+// declared edit changes the text, those runs no longer spell it, and a
+// renderer that trusted them would print the original wording — the reported
+// "同意后标题没有变" defect. The assembled block must therefore expose runs
+// that either match the new text or are dropped.
+func TestBuildEditClearsStaleRuns(t *testing.T) {
+	doc := src(docmodel.Node{
+		ID: "n0001", Kind: docmodel.KindHeading, Level: 1,
+		Text:  "一、总体要求",
+		Runs:  []docmodel.Run{{Text: "一、总体要"}, {Text: "求", Bold: true}},
+		Order: 0,
+	}, para("n0002", "正文。"))
+	plan := &docmodel.Plan{
+		Edits: []docmodel.Edit{{
+			NodeID: "n0001", Kind: docmodel.EditHeading,
+			Before: "一、总体要求", After: "一、总体目标",
+		}},
+		Sections: []docmodel.Section{
+			{ID: "s1", Title: "一、总体要求", Level: 1,
+				HeadingNodeID: "n0001", BodyNodeIDs: []string{"n0002"}},
+		},
+	}
+	res, err := Build(doc, plan, spec())
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	var heading *docmodel.OutBlock
+	for i := range res.Doc.Blocks {
+		if res.Doc.Blocks[i].NodeID == "n0001" {
+			heading = &res.Doc.Blocks[i]
+		}
+	}
+	if heading == nil {
+		t.Fatal("未生成标题块")
+	}
+	if heading.Text != "一、总体目标" {
+		t.Fatalf("标题文字 = %q", heading.Text)
+	}
+	if len(heading.Runs) != 0 {
+		t.Errorf("改动后不得保留源 runs: %+v", heading.Runs)
+	}
+	var joined strings.Builder
+	for _, run := range heading.Runs {
+		joined.WriteString(run.Text)
+	}
+	if joined.Len() > 0 {
+		t.Errorf("改动后遗留的源 runs 会打印旧文字: runs=%q text=%q",
+			joined.String(), heading.Text)
+	}
+}

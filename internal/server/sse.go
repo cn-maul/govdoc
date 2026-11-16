@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"govdoc/internal/api"
+	"govdoc/internal/baseline"
 	"govdoc/internal/store"
 )
 
@@ -58,18 +59,18 @@ func (s *Server) handleJobEvents(w http.ResponseWriter, r *http.Request) {
 	// finished long ago.
 	for _, u := range history {
 		if u.Done {
-			writeSSEDone(w, job)
+			s.writeSSEDone(w, job)
 			flusher.Flush()
 			return
 		}
-		if !writeSSE(w, "stage", u) {
+		if !writeSSE(w, eventName(u), stagePayload(u)) {
 			return
 		}
 	}
 	if done {
 		// Settled with no terminal frame recorded: still honour the contract
 		// rather than closing silently after a run of stage frames.
-		writeSSEDone(w, job)
+		s.writeSSEDone(w, job)
 		flusher.Flush()
 		return
 	}
@@ -91,11 +92,11 @@ func (s *Server) handleJobEvents(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if u.Done {
-				writeSSEDone(w, job)
+				s.writeSSEDone(w, job)
 				flusher.Flush()
 				return
 			}
-			if !writeSSE(w, "stage", u) {
+			if !writeSSE(w, eventName(u), stagePayload(u)) {
 				return
 			}
 			flusher.Flush()
@@ -105,7 +106,7 @@ func (s *Server) handleJobEvents(w http.ResponseWriter, r *http.Request) {
 			// full buffer), so completion is detected here and the result is
 			// read from the job rather than from the channel. Without this,
 			// a stalled subscriber would hang forever with no `done` frame.
-			writeSSEDone(w, job)
+			s.writeSSEDone(w, job)
 			flusher.Flush()
 			return
 		case <-heartbeat.C:
@@ -117,6 +118,23 @@ func (s *Server) handleJobEvents(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+// eventName maps a store update to its SSE event name.
+func eventName(u store.StageUpdate) string {
+	if u.Kind == "partial" {
+		return "partial"
+	}
+	return "stage"
+}
+
+// stagePayload strips store-only fields from a stage frame. The partial frame
+// carries the provisional plan; an ordinary stage carries only progress text.
+func stagePayload(u store.StageUpdate) any {
+	if u.Kind == "partial" {
+		return api.PartialEvent{Plan: u.Plan, Edits: u.Edits, Reset: u.Reset}
+	}
+	return api.StageEvent{Name: u.Name, Message: u.Message, Done: u.Done}
 }
 
 // writeSSE emits one named event frame. It reports false when the client has
@@ -134,10 +152,19 @@ func writeSSE(w http.ResponseWriter, event string, payload any) bool {
 	return true
 }
 
-// writeSSEDone emits the terminal frame carrying the plan and its verdict.
-func writeSSEDone(w http.ResponseWriter, job *store.Job) {
+// writeSSEDone emits the terminal frame carrying the plan, its verdict, and
+// the structural diff against the source's own outline.
+//
+// The diff has to be computed here rather than stored on the job: it depends
+// on the *baseline*, which is derived from the document and therefore cheap to
+// recompute, and deriving it at read time means a reload mid-analysis sees the
+// same frame a live subscriber did.
+func (s *Server) writeSSEDone(w http.ResponseWriter, job *store.Job) {
 	plan, report, err, _ := job.Result()
 	ev := api.DoneEvent{Plan: plan, Report: report}
+	if sess, serr := s.store.Session(job.DocID); serr == nil && plan != nil {
+		ev.Structure = baseline.Compare(sess.Doc, baseline.Build(sess.Doc), plan)
+	}
 	if err != nil {
 		ev.Error = err.Error()
 	}

@@ -5,6 +5,7 @@
 package api
 
 import (
+	"govdoc/internal/baseline"
 	"govdoc/internal/docmodel"
 	"govdoc/internal/gbstandard"
 )
@@ -53,6 +54,20 @@ type LLMConfig struct {
 	APIKeySet bool   `json:"api_key_set"`
 	// APIKey is accepted on write and ignored on read.
 	APIKey string `json:"api_key,omitempty"`
+}
+
+// ModelListRequest asks the server to probe a model connection and return its
+// catalog. Endpoint is required; APIKey may be omitted when the saved key
+// belongs to the same endpoint.
+type ModelListRequest struct {
+	Endpoint string `json:"endpoint"`
+	Protocol string `json:"protocol,omitempty"`
+	APIKey   string `json:"api_key,omitempty"`
+}
+
+// ModelListResponse is the model ids discovered at the endpoint.
+type ModelListResponse struct {
+	Models []string `json:"models"`
 }
 
 // ConfigResponse is the full application configuration.
@@ -203,6 +218,15 @@ type PlanRequest struct {
 	// enabling this never allows a silent rewrite — it only allows a *visible*
 	// one.
 	AllowEdits *bool `json:"allow_edits,omitempty"`
+	// Baseline asks for a structure derived from the document's own numbering
+	// instead of from a model.
+	//
+	// It exists because "no model configured" currently means "no output at
+	// all", even for a document that already numbers its chapters — where the
+	// structure is not a judgement call but a reading. The result is a
+	// starting point the user can edit, not a substitute for analysis: no
+	// chapter is invented, no title is guessed beyond the opening line.
+	Baseline bool `json:"baseline,omitempty"`
 }
 
 // PlanJobResponse is returned when analysis starts; the client then follows
@@ -218,20 +242,60 @@ type StageEvent struct {
 	Done    bool   `json:"done"`
 }
 
+// PartialEvent streams a provisional snapshot while the model is still
+// writing its answer.
+//
+// The plan is not complete and has not passed VerifyPlan. The client uses it
+// only to append structure rows and review cards; the terminal DoneEvent
+// remains the sole authority for what may be rendered.
+type PartialEvent struct {
+	Plan  *docmodel.Plan  `json:"plan,omitempty"`
+	Edits []docmodel.Edit `json:"edits,omitempty"`
+	Reset bool            `json:"reset,omitempty"`
+}
+
 // PlanResponse carries a plan together with its verification verdict. The
 // pair always travels together so the UI can never display a plan without
 // knowing whether it is renderable.
 type PlanResponse struct {
 	Plan   *docmodel.Plan   `json:"plan"`
 	Report *docmodel.Report `json:"report"`
-	JobID  string           `json:"job_id,omitempty"`
+	// Structure compares the plan against the structure the source document
+	// itself declares. VerifyPlan proves nothing was lost or duplicated;
+	// this is what shows whether anything was *moved* — the structural
+	// counterpart of the text-level change log.
+	Structure *baseline.StructureDiff `json:"structure,omitempty"`
+	JobID     string                  `json:"job_id,omitempty"`
+}
+
+// ReviseRequest asks the model for declared content edits in response to a
+// chat instruction. Nothing in the request is written into the document; the
+// model answers with Edits that the user reviews one by one.
+type ReviseRequest struct {
+	Instruction string `json:"instruction"`
+	// Selection is the text the user highlighted in the preview. Empty means
+	// the instruction applies to the whole document.
+	Selection string `json:"selection,omitempty"`
+	// NodeID scopes the request to one source block when the selection came
+	// from it.
+	NodeID string `json:"node_id,omitempty"`
+	// AllowEdits overrides the saved preference for this turn.
+	AllowEdits *bool `json:"allow_edits,omitempty"`
+}
+
+// ReviseResponse carries proposed edits plus the chat reply. The edits are
+// not applied: each one still has to be accepted by the user.
+type ReviseResponse struct {
+	Edits []docmodel.Edit `json:"edits"`
+	Reply string          `json:"reply,omitempty"`
 }
 
 // DoneEvent is the terminal SSE frame.
 type DoneEvent struct {
-	Plan   *docmodel.Plan   `json:"plan"`
-	Report *docmodel.Report `json:"report"`
-	Error  string           `json:"error,omitempty"`
+	Plan      *docmodel.Plan          `json:"plan"`
+	Report    *docmodel.Report        `json:"report"`
+	Structure *baseline.StructureDiff `json:"structure,omitempty"`
+	Error     string                  `json:"error,omitempty"`
 }
 
 // RenderRequest asks for the formatted output.

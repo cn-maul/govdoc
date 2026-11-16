@@ -273,11 +273,23 @@ func (a *analyzerAdapter) Reconfigure(cfg server.LLMConfig) error {
 	return nil
 }
 
+// ListModels probes a connection the user has not saved yet. Model is left
+// empty on purpose: the settings UI calls this precisely to choose one.
+func (a *analyzerAdapter) ListModels(ctx context.Context, cfg server.LLMConfig) ([]string, error) {
+	return llm.ListModelsFor(ctx, llm.Config{
+		Endpoint: cfg.Endpoint,
+		APIKey:   cfg.APIKey,
+		Protocol: cfg.Protocol,
+		Timeout:  cfg.Timeout,
+	})
+}
+
 func (a *analyzerAdapter) Analyze(
 	ctx context.Context,
 	doc *docmodel.Document,
 	opts server.AnalysisOptions,
 	progress func(server.Progress),
+	partial func(server.PartialProgress),
 ) (*docmodel.Plan, error) {
 	if a.client == nil {
 		return nil, llm.ErrNotConfigured
@@ -288,6 +300,12 @@ func (a *analyzerAdapter) Analyze(
 			progress(server.Progress{Name: s.Name, Message: s.Message, Done: s.Done})
 		}
 	}
+	var pc func(llm.PartialPlan)
+	if partial != nil {
+		pc = func(p llm.PartialPlan) {
+			partial(server.PartialProgress{Plan: p.Plan, Edits: p.Edits, Reset: p.Reset})
+		}
+	}
 	// Both options must be forwarded: the hint is what the user typed about the
 	// document's nature, and AllowEdits is what decides whether the model may
 	// propose content corrections at all. Dropping either here would make the
@@ -296,7 +314,30 @@ func (a *analyzerAdapter) Analyze(
 	return a.client.PlanWithOptions(ctx, doc, llm.PlanOptions{
 		Hint:       opts.Hint,
 		AllowEdits: opts.AllowEdits,
+		Partial:    pc,
 	}, cb)
+}
+
+// Revise turns a chat instruction into declared edits. It is the bridge for
+// the workbench's chat panel: the server verifies and stores nothing here, so
+// the user still reviews each edit before it reaches the plan.
+func (a *analyzerAdapter) Revise(
+	ctx context.Context,
+	doc *docmodel.Document,
+	req server.RevisionRequest,
+) (server.RevisionResult, error) {
+	if a.client == nil {
+		return server.RevisionResult{}, llm.ErrNotConfigured
+	}
+	res, err := a.client.Revise(ctx, doc, llm.RevisionRequest{
+		Instruction: req.Instruction,
+		Selection:   req.Selection,
+		NodeID:      req.NodeID,
+	})
+	if err != nil {
+		return server.RevisionResult{}, err
+	}
+	return server.RevisionResult{Edits: res.Edits, Reply: res.Reply}, nil
 }
 
 func usage() {

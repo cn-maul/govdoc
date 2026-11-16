@@ -63,7 +63,14 @@ type File struct {
 	// built-in 公文 profile (and any profile that leaves it empty).
 	Direction string `json:"direction,omitempty"`
 	// AllowEdits records whether the user permits content corrections.
-	AllowEdits bool `json:"allow_edits,omitempty"`
+	//
+	// It is a pointer so "never chosen" is distinguishable from an explicit
+	// false. With a plain bool both looked like the zero value, so a fresh
+	// install and a user who deliberately turned corrections off could not be
+	// told apart. The 校对 pane is a core part of the workbench, so a fresh
+	// install proposes corrections by default; only an explicit false keeps
+	// them off.
+	AllowEdits *bool `json:"allow_edits,omitempty"`
 	// ActiveProfile is the id of the profile applied to new uploads when the UI
 	// has not chosen one explicitly.
 	ActiveProfile string `json:"active_profile,omitempty"`

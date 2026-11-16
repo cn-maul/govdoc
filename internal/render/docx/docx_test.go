@@ -944,6 +944,41 @@ func TestRenderRunsPreserveInlineStyle(t *testing.T) {
 	}
 }
 
+// TestRenderEditedBlockUsesTextOverStaleRuns: an accepted edit changes Text
+// but the block may still carry the source's runs. Printing the runs would
+// silently reproduce the pre-edit wording — the reported defect where a title
+// approved for change still downloaded unchanged.
+func TestRenderEditedBlockUsesTextOverStaleRuns(t *testing.T) {
+	doc := &docmodel.Doc{
+		Blocks: []docmodel.OutBlock{{
+			Role:   docmodel.RoleTitle,
+			Text:   "一、总体目标",
+			Edited: true,
+			Runs:   []docmodel.Run{{Text: "一、总体要求"}},
+		}},
+	}
+	data, err := Render(doc, gbstandard.Default())
+	if err != nil {
+		t.Fatalf("Render 失败: %v", err)
+	}
+	parts := zipEntries(t, data)
+
+	var document documentNode
+	if err := xml.Unmarshal(parts["word/document.xml"], &document); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if len(document.Body.Paragraphs) != 1 {
+		t.Fatalf("期望 1 个段落，实际 %d", len(document.Body.Paragraphs))
+	}
+	var got strings.Builder
+	for _, run := range document.Body.Paragraphs[0].Runs {
+		got.WriteString(run.Text)
+	}
+	if got.String() != "一、总体目标" {
+		t.Errorf("导出文字 = %q, 期望改动后的文字", got.String())
+	}
+}
+
 // TestRenderBordersFromSpec proves the 红色分隔线 and 版记 rules come from the
 // spec's BorderRule rather than a literal.
 func TestRenderBordersFromSpec(t *testing.T) {

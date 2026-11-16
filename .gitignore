@@ -34,6 +34,8 @@ Thumbs.db
 .env
 .env.local
 *.local.json
+# govdoc.config.json 是 exe 同目录的运行配置，保存了 API Key，只能留在本机。
+/govdoc.config.json
 
 # ---- e2e 输出 ----
 /out/

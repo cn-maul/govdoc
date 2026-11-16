@@ -365,7 +365,7 @@ func TestEditHelpers(t *testing.T) {
 	// The labels the UI shows must be the ones documented.
 	want := map[EditKind]string{
 		EditTypo: "错别字", EditGrammar: "语病/语句不通", EditWording: "用词不严谨",
-		EditPunctuation: "标点", EditSentenceSplit: "断句", EditHeading: "新增标题",
+		EditPunctuation: "标点", EditSentenceSplit: "断句", EditHeading: "标题",
 	}
 	for k, label := range want {
 		if got := EditLabel(k); got != label {

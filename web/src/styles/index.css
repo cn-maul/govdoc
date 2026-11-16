@@ -1,0 +1,87 @@
+/*
+ * 样式入口。
+ *
+ * 不写 `@import "@heroui/styles"` —— 那会整包引入 86 个组件的 CSS（产物约
+ * 734 kB），其中日历、取色器、滑块、日期选择器等本项目一个都不渲染。这里按
+ * 实际用到的组件逐个引入，产物约 330 kB。
+ *
+ * 两条规矩，缺一条都会「结构对、样子错」：
+ *
+ *   1. **必须声明并保留 CSS 层**。HeroUI 的组件样式写在 `layer(components)`，
+ *      Tailwind 工具类在 `layer(utilities)`。层序一旦丢失（例如逐个 import 时
+ *      忘了写 layer），组件样式会盖住调用点写的工具类，连 `text-[13px]` 这种
+ *      最基本的覆盖都会失效。
+ *   2. **共享件必须排在组件之前**（label / description / field-error /
+ *      close-button）。组件靠后面的规则覆盖共享件的默认值。
+ *
+ * **新用到 HeroUI 组件时，要在这里补一行 CSS**；改完跑一遍逐页截图核对。
+ */
+
+@layer theme, base, components, utilities;
+
+/* Tailwind v4 本体（工具类与 @theme 机制） */
+@import "tailwindcss";
+
+/* 基础层：盒模型、焦点环、减少动效等全局规则 */
+@import "@heroui/styles/base" layer(base);
+@import "@heroui/styles/base/scrollbar.css" layer(base);
+
+/* 主题：变量 + @theme inline 转发（颜色/圆角/动效令牌） */
+@import "@heroui/styles/themes/default" layer(theme);
+
+/* 共享件 —— 必须排在组件之前 */
+@import "@heroui/styles/components/close-button.css" layer(components);
+@import "@heroui/styles/components/description.css" layer(components);
+@import "@heroui/styles/components/error-message.css" layer(components);
+@import "@heroui/styles/components/field-error.css" layer(components);
+@import "@heroui/styles/components/label.css" layer(components);
+
+/* 导航与容器 */
+@import "@heroui/styles/components/disclosure.css" layer(components);
+@import "@heroui/styles/components/link.css" layer(components);
+@import "@heroui/styles/components/tabs.css" layer(components);
+@import "@heroui/styles/components/card.css" layer(components);
+@import "@heroui/styles/components/header.css" layer(components);
+@import "@heroui/styles/components/separator.css" layer(components);
+@import "@heroui/styles/components/surface.css" layer(components);
+
+/* 按钮 */
+@import "@heroui/styles/components/button.css" layer(components);
+@import "@heroui/styles/components/toggle-button.css" layer(components);
+@import "@heroui/styles/components/toggle-button-group.css" layer(components);
+
+/* 集合与浮层（Select 依赖 ListBox + Popover + ScrollShadow） */
+@import "@heroui/styles/components/list-box.css" layer(components);
+@import "@heroui/styles/components/list-box-item.css" layer(components);
+@import "@heroui/styles/components/list-box-section.css" layer(components);
+@import "@heroui/styles/components/popover.css" layer(components);
+@import "@heroui/styles/components/scroll-shadow.css" layer(components);
+
+/* 数据展示 */
+@import "@heroui/styles/components/badge.css" layer(components);
+@import "@heroui/styles/components/chip.css" layer(components);
+@import "@heroui/styles/components/table.css" layer(components);
+
+/* 反馈 */
+@import "@heroui/styles/components/alert.css" layer(components);
+@import "@heroui/styles/components/empty-state.css" layer(components);
+@import "@heroui/styles/components/progress-bar.css" layer(components);
+@import "@heroui/styles/components/spinner.css" layer(components);
+@import "@heroui/styles/components/toast.css" layer(components);
+
+/* 表单 */
+@import "@heroui/styles/components/checkbox.css" layer(components);
+@import "@heroui/styles/components/input.css" layer(components);
+@import "@heroui/styles/components/switch.css" layer(components);
+@import "@heroui/styles/components/textfield.css" layer(components);
+@import "@heroui/styles/components/search-field.css" layer(components);
+@import "@heroui/styles/components/textarea.css" layer(components);
+@import "@heroui/styles/components/select.css" layer(components);
+
+/* 工具类与自定义变体（focus-ring / motion-safe / dark 等） */
+@import "@heroui/styles/utilities";
+@import "@heroui/styles/variants";
+
+/* 本项目自己的令牌与样式 */
+@import "./tokens.css";
+@import "./app.css";

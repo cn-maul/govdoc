@@ -55,6 +55,21 @@ type Report struct {
 	// HeadingsAsBody counts source heading paragraphs claimed as section body,
 	// which makes them render as a second heading of that level.
 	HeadingsAsBody int `json:"headings_as_body"`
+	// SectionsOutOfOrder counts sections whose content sits before the
+	// content of the section emitted above them. Such a plan renders, but the
+	// printed order differs from the source's — and when the source headings
+	// carry their own 层次序数, the page shows "二、" before "一、".
+	SectionsOutOfOrder int `json:"sections_out_of_order"`
+	// RecomposedNodes counts source paragraphs the plan split into several
+	// paragraphs.
+	RecomposedNodes int `json:"recomposed_nodes"`
+	// RecomposedParts counts the declared output paragraphs produced by those
+	// splits.
+	RecomposedParts int `json:"recomposed_parts"`
+	// HeavyRecompose counts recomposed paragraphs whose output is much shorter
+	// than the source, i.e. cases where the model summarised instead of
+	// reorganising. Exportable, but surfaced for review.
+	HeavyRecompose int `json:"heavy_recompose"`
 }
 
 // OK reports whether the plan is renderable: no error-severity diagnostics
@@ -99,6 +114,214 @@ func (r *Report) Summary() string {
 	}
 	return fmt.Sprintf("%s：正文节点 %d/%d 已覆盖，重复 %d，无效引用 %d",
 		status, r.CoveredNodes, r.ContentNodes, r.DuplicatedNodes, r.UnknownRefs)
+}
+
+// validateRecompose checks the shape of Plan.Recompose and returns it indexed
+// by source node.
+//
+// A declaration is accepted only when every part is non-empty, the node exists
+// in the source, and the declaration appears once. These are pure shape checks;
+// whether the parts actually reproduce the source is decided by
+// VerifyVerbatim, which has the assembled text to compare.
+func validateRecompose(rep *Report, doc *Document, plan *Plan, contentSet map[string]bool) map[string]Recompose {
+	out := map[string]Recompose{}
+	if plan == nil {
+		return out
+	}
+	recipientBound := false
+	for _, e := range plan.Elements {
+		if e.Role == RoleRecipient && e.NodeID != "" {
+			recipientBound = true
+			break
+		}
+	}
+	recipientOwner := ""
+	for i, rec := range plan.Recompose {
+		if rec.NodeID == "" {
+			rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+				Code: "bad_recompose", Severity: SevError,
+				Message: fmt.Sprintf("重组声明 #%d 缺少 node_id", i+1),
+			})
+			continue
+		}
+		if _, ok := doc.Node(rec.NodeID); !ok {
+			rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+				Code: "unknown_ref", Severity: SevError,
+				Message: fmt.Sprintf("重组声明引用了原文中不存在的节点 %q", rec.NodeID),
+				NodeIDs: []string{rec.NodeID},
+			})
+			continue
+		}
+		if !contentSet[rec.NodeID] {
+			rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+				Code: "bad_recompose", Severity: SevError,
+				Message: fmt.Sprintf("节点 %s 不携带正文，不能声明重组", rec.NodeID),
+				NodeIDs: []string{rec.NodeID},
+			})
+			continue
+		}
+		n, ok := doc.Node(rec.NodeID)
+		if ok && (n.Kind == KindTable || n.Kind == KindImage) {
+			rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+				Code: "bad_recompose", Severity: SevError,
+				Message: fmt.Sprintf("节点 %s 是表格或图片，不能作为文字段落重组", rec.NodeID),
+				NodeIDs: []string{rec.NodeID},
+			})
+			continue
+		}
+		if _, dup := out[rec.NodeID]; dup {
+			rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+				Code: "duplicate_recompose", Severity: SevError,
+				Message: fmt.Sprintf("节点 %s 有多条重组声明，无法确定以哪一条为准", rec.NodeID),
+				NodeIDs: []string{rec.NodeID},
+			})
+			continue
+		}
+		if len(rec.Parts) == 0 {
+			rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+				Code: "bad_recompose", Severity: SevError,
+				Message: fmt.Sprintf("节点 %s 的重组声明没有任何段落", rec.NodeID),
+				NodeIDs: []string{rec.NodeID},
+			})
+			continue
+		}
+		if len(plan.EditsFor(rec.NodeID)) > 0 {
+			rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+				Code: "recompose_conflict_edits", Severity: SevError,
+				Message: fmt.Sprintf(
+					"节点 %s 同时声明了重组和逐字修改；重组后的文字请直接写进 parts，不要再给同一节点加 edits",
+					rec.NodeID),
+				NodeIDs: []string{rec.NodeID},
+			})
+			continue
+		}
+		if len(rec.Roles) > 0 && len(rec.Roles) != len(rec.Parts) {
+			rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+				Code: "bad_recompose", Severity: SevError,
+				Message: fmt.Sprintf(
+					"节点 %s 的 roles 有 %d 项，与 parts 的 %d 段不一致",
+					rec.NodeID, len(rec.Roles), len(rec.Parts)),
+				NodeIDs: []string{rec.NodeID},
+			})
+			continue
+		}
+		badRole := false
+		// Role parts are emitted in a fixed skeleton order: 主送机关, then
+		// 正文前言, then the section tree. VerifyVerbatim compares the
+		// emitted parts against rec.Parts in order, so the role parts must
+		// be a prefix of Parts and recipient must come first. Stating the
+		// rule here turns a later "recompose order" mismatch into an error
+		// that names the offending part.
+		bodySeen := false
+		for j, role := range rec.Roles {
+			if role == "" {
+				bodySeen = true
+				continue
+			}
+			if bodySeen {
+				rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+					Code: "bad_recompose", Severity: SevError,
+					Message: fmt.Sprintf(
+						"节点 %s 的第 %d 段带 role，却排在普通正文之后；"+
+							"主送机关和正文前言必须是 parts 开头连续的一段",
+						rec.NodeID, j),
+					NodeIDs: []string{rec.NodeID},
+				})
+				badRole = true
+			}
+			switch role {
+			case RecomposeRoleRecipient:
+				if j != 0 {
+					rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+						Code: "bad_recompose", Severity: SevError,
+						Message: fmt.Sprintf(
+							"节点 %s 的主送机关分片必须是第 0 段（实际在第 %d 段）；"+
+								"否则它会排到正文前言之后",
+							rec.NodeID, j),
+						NodeIDs: []string{rec.NodeID},
+					})
+					badRole = true
+				}
+				if recipientOwner != "" {
+					rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+						Code: "bad_recompose", Severity: SevError,
+						Message: fmt.Sprintf(
+							"节点 %s 和 %s 都声明了主送机关分片；主送机关只能有一个",
+							recipientOwner, rec.NodeID),
+						NodeIDs: []string{recipientOwner, rec.NodeID},
+					})
+					badRole = true
+				}
+				if recipientBound {
+					rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+						Code: "bad_recompose", Severity: SevError,
+						Message: fmt.Sprintf(
+							"节点 %s 用 role=recipient 拆出了主送机关，但 elements 里又绑定了另一个主送机关节点；"+
+								"二者只能保留一个",
+							rec.NodeID),
+						NodeIDs: []string{rec.NodeID},
+					})
+					badRole = true
+				}
+				recipientOwner = rec.NodeID
+			case RecomposeRolePreamble:
+				// preamble may be the first part (no recipient line) or the
+				// part right after recipient. A second recipient is rejected
+				// by the coverage tally.
+			case string(RoleBody):
+				rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+					Code: "bad_recompose", Severity: SevError,
+					Message: fmt.Sprintf(
+						"节点 %s 重组后的第 %d 段绑定为 body；正文分片应留空 role，并放进章节的 body_parts",
+						rec.NodeID, j),
+					NodeIDs: []string{rec.NodeID},
+				})
+				badRole = true
+			default:
+				rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+					Code: "bad_recompose", Severity: SevError,
+					Message: fmt.Sprintf(
+						"节点 %s 重组后的第 %d 段使用了不支持的 role %q；"+
+							"可用 recipient（主送机关）和 preamble（正文前言），普通正文留空",
+						rec.NodeID, j, role),
+					NodeIDs: []string{rec.NodeID},
+				})
+				badRole = true
+			}
+		}
+		if badRole {
+			continue
+		}
+		if ok {
+			if srcLen, outLen := runeLen(n.Text), recomposeLen(rec.Parts); srcLen > 0 && outLen*10 < srcLen*6 {
+				rep.HeavyRecompose++
+				rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+					Code: "heavy_recompose", Severity: SevWarning,
+					Message: fmt.Sprintf(
+						"节点 %s 重组后只有原文的 %d%%（原文 %d 字 → 重组 %d 字）："+
+							"这更接近概括而非整理，请确认没有删掉原文信息",
+						rec.NodeID, outLen*100/srcLen, srcLen, outLen),
+					NodeIDs: []string{rec.NodeID},
+				})
+			}
+		}
+		bad := false
+		for j, part := range rec.Parts {
+			if strings.TrimSpace(part) == "" {
+				rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+					Code: "bad_recompose", Severity: SevError,
+					Message: fmt.Sprintf("节点 %s 重组后的第 %d 段为空", rec.NodeID, j),
+					NodeIDs: []string{rec.NodeID},
+				})
+				bad = true
+			}
+		}
+		if bad {
+			continue
+		}
+		out[rec.NodeID] = rec
+	}
+	return out
 }
 
 // BindableRoles lists the 公文 element slots a node may be bound to through
@@ -172,6 +395,16 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 	}
 	rep.ContentNodes = len(contentIDs)
 
+	// Recompose declarations define which nodes are allowed to appear as
+	// several output paragraphs. They are validated before the claim tally so
+	// the coverage rules can treat a recomposed node as a set of parts rather
+	// than as one indivisible paragraph.
+	recomposed := validateRecompose(rep, doc, plan, contentSet)
+	rep.RecomposedNodes = len(recomposed)
+	for _, r := range plan.Recompose {
+		rep.RecomposedParts += len(r.Parts)
+	}
+
 	// order gives each id its source position, for the reorder check.
 	order := make(map[string]int, len(doc.Nodes))
 	if doc != nil {
@@ -204,6 +437,46 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 		claimedAs[id] = append(claimedAs[id], where)
 	}
 
+	// partClaims counts claims per (node, part). A whole-node claim sets the
+	// per-node count instead; the two forms are mutually exclusive.
+	partClaims := map[string][]int{}
+	claimPart := func(nodeID string, part int, where string) {
+		if _, ok := recomposed[nodeID]; !ok {
+			return
+		}
+		if part < 0 || part >= len(recomposed[nodeID].Parts) {
+			return
+		}
+		claims[nodeID]++
+		claimedAs[nodeID] = append(claimedAs[nodeID], where)
+		list := partClaims[nodeID]
+		for len(list) < len(recomposed[nodeID].Parts) {
+			list = append(list, 0)
+		}
+		list[part]++
+		partClaims[nodeID] = list
+	}
+
+	// Role parts are claimed by the recompose declaration itself, not by a
+	// section. They are emitted in the skeleton (主送机关, then 前言), so a
+	// body_parts entry for the same part would print it twice; claimPart's
+	// per-part tally is therefore enough to detect that, while this loop
+	// makes the skeleton placement count as coverage. A non-empty role must
+	// be an element slot (recipient) or the preamble slot, never body.
+	for _, rec := range plan.Recompose {
+		for j, role := range rec.Roles {
+			switch role {
+			case "":
+			case RecomposeRoleRecipient, RecomposeRolePreamble:
+				where := "前言"
+				if role == RecomposeRoleRecipient {
+					where = "要素:recipient"
+				}
+				claimPart(rec.NodeID, j, where)
+			}
+		}
+	}
+
 	var unknown []string
 	seenUnknown := map[string]bool{}
 	noteUnknown := func(id string) {
@@ -220,7 +493,14 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 	// node is by definition not body content: claiming it here is what stops
 	// the source's own 标题/成文日期 paragraphs from being reported as
 	// dropped content.
+	//
+	// Only the FIRST binding of each role is counted as a claim. A later
+	// duplicate is an error (reported below as duplicate_element), and the
+	// assembler emits only the first one; counting both would additionally
+	// report the same paragraph as duplicate_content, making a single
+	// mistake look like a lost-and-duplicated document.
 	rep.BoundElements = len(plan.Elements)
+	firstRole := map[Role]bool{}
 	for i, e := range plan.Elements {
 		if e.NodeID == "" {
 			rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
@@ -230,6 +510,17 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 			continue
 		}
 		noteUnknown(e.NodeID)
+		if rec, ok := recomposed[e.NodeID]; ok && len(rec.Parts) > 0 {
+			rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+				Code: "recomposed_whole_claim", Severity: SevError,
+				Message: fmt.Sprintf(
+					"节点 %s 已声明重组为 %d 段，不能再整体绑定到要素 %s；"+
+						"请把所需文字放进重组后的段落，或取消该重组声明",
+					e.NodeID, len(rec.Parts), e.Role),
+				NodeIDs: []string{e.NodeID},
+			})
+			continue
+		}
 		switch {
 		case e.Role == RoleBody:
 			rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
@@ -250,6 +541,10 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 			})
 			continue
 		}
+		if firstRole[e.Role] {
+			continue
+		}
+		firstRole[e.Role] = true
 		claim(e.NodeID, fmt.Sprintf("要素:%s", e.Role))
 	}
 	seenElementRole := map[Role]string{}
@@ -273,10 +568,31 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 	// without requiring a fabricated section for it.
 	for _, id := range plan.PreambleNodeIDs {
 		noteUnknown(id)
+		if rec, ok := recomposed[id]; ok && len(rec.Parts) > 0 {
+			rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+				Code: "recomposed_whole_claim", Severity: SevError,
+				Message: fmt.Sprintf(
+					"节点 %s 已声明重组为 %d 段，不能同时整体放进正文前言；"+
+						"请改用章节的 body_parts 放置各段",
+					id, len(rec.Parts)),
+				NodeIDs: []string{id},
+			})
+			continue
+		}
 		claim(id, "前言")
 	}
 
 	// walk validates the tree and records every claim.
+	//
+	// Section ids are checked for uniqueness here, not just for presence. The
+	// document renders correctly without unique ids — the assembler walks the
+	// tree by position — but every client addresses a section BY ID (rename,
+	// move, detach, relocate, React keys). Duplicate ids therefore do not
+	// corrupt the .docx; they corrupt the review screen, where an edit lands on
+	// a different chapter than the one the user clicked. That failure is silent
+	// precisely because the output looks right, so it has to be refused where
+	// every other structural guarantee is enforced.
+	seenSectionIDs := make(map[string]bool)
 	var walk func(list []Section, parentLevel int, path string) bool
 	walk = func(list []Section, parentLevel int, path string) bool {
 		ok := true
@@ -289,6 +605,19 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 					Message: fmt.Sprintf("第 %d 个章节缺少 id（%s）", i+1, where),
 				})
 				ok = false
+			} else if seenSectionIDs[s.ID] {
+				rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+					Code: "duplicate_section_id", Severity: SevError,
+					Message: fmt.Sprintf(
+						"章节 id %q 重复（%s）：界面按 id 定位章节，"+
+							"重复时修改标题、移动段落会落到错误的章节上",
+						s.ID, where),
+					NodeIDs: []string{s.ID},
+				})
+				ok = false
+			}
+			if s.ID != "" {
+				seenSectionIDs[s.ID] = true
 			}
 			if s.Level < 1 {
 				rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
@@ -309,6 +638,16 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 
 			if s.HeadingNodeID != "" {
 				noteUnknown(s.HeadingNodeID)
+				if rec, ok := recomposed[s.HeadingNodeID]; ok && len(rec.Parts) > 0 {
+					rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+						Code: "recomposed_whole_claim", Severity: SevError,
+						Message: fmt.Sprintf(
+							"章节 %s 把重组节点 %s 当标题引用；重组段落只能通过 body_parts 放置",
+							s.ID, s.HeadingNodeID),
+						NodeIDs: []string{s.HeadingNodeID},
+					})
+					ok = false
+				}
 				claim(s.HeadingNodeID, "标题:"+s.ID)
 				if n, found := doc.Node(s.HeadingNodeID); found {
 					if strings.TrimSpace(s.Title) != strings.TrimSpace(n.Text) {
@@ -331,7 +670,8 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 				})
 			}
 
-			if len(s.BodyNodeIDs) == 0 && len(s.Children) == 0 && s.HeadingNodeID == "" {
+			if len(s.BodyNodeIDs) == 0 && len(s.BodyParts) == 0 &&
+				len(s.Children) == 0 && s.HeadingNodeID == "" {
 				rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
 					Code: "empty_section", Severity: SevWarning,
 					Message: fmt.Sprintf("章节 %s 没有任何内容", s.ID),
@@ -340,8 +680,21 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 
 			prev := -1
 			ascending := true
+			sectionOK := true
 			for _, id := range s.BodyNodeIDs {
 				noteUnknown(id)
+				if rec, isRec := recomposed[id]; isRec && len(rec.Parts) > 0 {
+					rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+						Code: "recomposed_whole_claim", Severity: SevError,
+						Message: fmt.Sprintf(
+							"章节 %s 把重组节点 %s 整体放进 body_node_ids；"+
+								"请用 body_parts 逐段放置，避免整段重复出现",
+							s.ID, id),
+						NodeIDs: []string{id},
+					})
+					sectionOK = false
+					continue
+				}
 				claim(id, "正文:"+s.ID)
 				if o, found := order[id]; found {
 					if prev >= 0 && o < prev {
@@ -368,15 +721,54 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 					})
 				}
 			}
+			for _, bp := range s.BodyParts {
+				noteUnknown(bp.NodeID)
+				rec, isRec := recomposed[bp.NodeID]
+				if !isRec {
+					rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+						Code: "undeclared_body_part", Severity: SevError,
+						Message: fmt.Sprintf(
+							"章节 %s 引用了节点 %s 的第 %d 段，但方案没有为该节点声明重组",
+							s.ID, bp.NodeID, bp.Part),
+						NodeIDs: []string{bp.NodeID},
+					})
+					sectionOK = false
+					continue
+				}
+				if _, found := rec.PartText(bp.Part); !found {
+					rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+						Code: "bad_body_part", Severity: SevError,
+						Message: fmt.Sprintf(
+							"章节 %s 引用了节点 %s 不存在的第 %d 段（该节点共 %d 段）",
+							s.ID, bp.NodeID, bp.Part, len(rec.Parts)),
+						NodeIDs: []string{bp.NodeID},
+					})
+					sectionOK = false
+					continue
+				}
+				claimPart(bp.NodeID, bp.Part, "正文:"+s.ID)
+				if o, found := order[bp.NodeID]; found {
+					if prev >= 0 && o < prev {
+						ascending = false
+					}
+					prev = o
+				}
+			}
+			if !sectionOK {
+				ok = false
+			}
 			if !ascending {
 				rep.ReorderedSections++
+				// A declared recomposition is allowed to move prose between
+				// paragraphs; that is what the declaration is for. The
+				// reorder is then information, not a warning.
 				sev := SevWarning
 				msg := fmt.Sprintf("章节 %s 的正文顺序与原文不一致（原文顺序被调整）", s.ID)
-				if s.PreserveOrder {
+				if s.PreserveOrder || len(plan.Recompose) > 0 {
 					// The model declared the reorder deliberately; still
 					// visible, but as information rather than a warning.
 					sev = SevInfo
-					msg = fmt.Sprintf("章节 %s 的正文顺序经模型确认后调整", s.ID)
+					msg = fmt.Sprintf("章节 %s 的正文顺序已由重组声明调整", s.ID)
 				} else {
 					rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
 						Code: "reordered", Severity: sev, Message: msg,
@@ -399,6 +791,17 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 		return ok
 	}
 	walk(plan.Sections, 0, "")
+
+	// Whole-document order, across section boundaries.
+	//
+	// The per-section check inside walk() only compares body nodes *within* one
+	// section, so a plan that swaps two entire chapters passes it: each
+	// chapter's body is internally ascending. The printed document then shows
+	// the second chapter first, and because a source heading carries its own
+	// 层次序数 verbatim, the page reads "二、……" before "一、……". That is
+	// visible to any reader, so it must not pass silently.
+	rep.SectionsOutOfOrder = checkSectionOrder(rep, plan, order)
+	checkPreambleOrder(rep, doc, plan, order)
 
 	// A synthesized 标题 that duplicates a paragraph already covered as body
 	// prints the title twice. This is the shape of a real mistake, found by
@@ -425,6 +828,27 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 		}
 	}
 
+	// The same shape, one level down: a *section* title the plan supplied
+	// itself that happens to be the text of a paragraph already claimed as
+	// body. The source paragraph had no heading markup (so the parser called
+	// it 正文), the model noticed it reads like a heading and synthesized a
+	// section for it — but left the paragraph in body_node_ids. The assembled
+	// page prints that line twice, once as the synthesized heading and once as
+	// body, and coverage is complete so nothing else fires.
+	if dups := synthesizedTitleRepeats(doc, plan, claims); len(dups) > 0 {
+		for _, d := range dups {
+			rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+				Code: "duplicate_title", Severity: SevError,
+				Message: fmt.Sprintf(
+					"章节 %s 的标题 %q 与原文段落 %s 相同，而该段落已被收录为正文，"+
+						"成品中这一行会出现两次。请让该章节的 heading_node_id 指向 %s（标题即取该段原文），"+
+						"或把该段落从 body_node_ids 中移出",
+					d.sectionID, truncate(d.title, 24), d.nodeID, d.nodeID),
+				NodeIDs: []string{d.nodeID},
+			})
+		}
+	}
+
 	rep.UnknownRefs = len(unknown)
 	for _, id := range unknown {
 		rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
@@ -438,6 +862,51 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 	// the exact paragraphs at issue.
 	var missing, dup []string
 	for _, id := range contentIDs {
+		rec, isRec := recomposed[id]
+		if isRec && len(rec.Parts) > 0 {
+			got := partClaims[id]
+			if len(got) < len(rec.Parts) {
+				got = append(got, make([]int, len(rec.Parts)-len(got))...)
+			}
+			var missingParts, dupParts []int
+			for i := 0; i < len(rec.Parts); i++ {
+				switch got[i] {
+				case 0:
+					missingParts = append(missingParts, i)
+				case 1:
+				default:
+					dupParts = append(dupParts, i)
+				}
+			}
+			if len(missingParts) > 0 {
+				// The node itself was never wholly covered, so it counts as
+				// missing rather than as a partial success.
+				missing = append(missing, id)
+				rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+					Code: "uncovered_body_part", Severity: SevError,
+					Message: fmt.Sprintf(
+						"原文段落 %s 重组后有 %d 段没有被任何章节收录：%v：%q",
+						id, len(missingParts), missingParts, truncate(rec.Parts[missingParts[0]], 60)),
+					NodeIDs: []string{id},
+				})
+			}
+			if len(dupParts) > 0 {
+				dup = append(dup, id)
+				rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+					Code: "duplicate_body_part", Severity: SevError,
+					Message: fmt.Sprintf(
+						"原文段落 %s 重组后的第 %v 段被重复收录",
+						id, dupParts),
+					NodeIDs: []string{id},
+				})
+				continue
+			}
+			if len(missingParts) == 0 && len(got) > 0 {
+				// Every part placed exactly once: the node is covered.
+				claims[id] = 1
+			}
+			continue
+		}
 		switch c := claims[id]; {
 		case c == 0:
 			missing = append(missing, id)
@@ -482,6 +951,212 @@ func VerifyPlan(doc *Document, plan *Plan) *Report {
 		return rep.Diagnostics[i].Code < rep.Diagnostics[j].Code
 	})
 	return rep
+}
+
+// checkSectionOrder compares the source position of each section's first
+// heading/body with the position of the previous section's last content, and
+// reports every section that starts before its predecessor ended.
+//
+// It walks in emission order — depth-first, exactly as assemble emits — so the
+// comparison reflects the printed page rather than the JSON's nesting. A
+// section whose heading is synthesized has no source position of its own, so
+// its body stands in; a section with neither is skipped (empty_section already
+// covers it).
+//
+// Returns the number of offending sections, which is also stored on the report
+// so the review screen can badge it the way it badges the per-section reorder
+// count.
+func checkSectionOrder(rep *Report, plan *Plan, order map[string]int) int {
+	if plan == nil {
+		return 0
+	}
+	// A recomposed document has deliberately reordered prose inside its
+	// source paragraphs, and the source has no chapter order to compare
+	// against. Reporting every part as "out of order" would bury the change
+	// the user actually needs to review (the recomposition) under warnings.
+	if len(plan.Recompose) > 0 {
+		return 0
+	}
+	var bad int
+	// The cursor is the highest source position emitted so far. A struct holds
+	// it because a Go closure cannot assign to a variable declared after it.
+	cursor := &orderCursor{order: order}
+	var visit func([]Section)
+	visit = func(list []Section) {
+		for i := range list {
+			s := &list[i]
+			pos, ok := sectionStart(s, order)
+			if !ok {
+				visit(s.Children)
+				continue
+			}
+			if cursor.seen && pos < cursor.high {
+				bad++
+				rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+					Code: "section_order", Severity: SevWarning,
+					Message: fmt.Sprintf(
+						"章节 %s（%q）的内容在原文中位于上一章节之前：成品会按方案的顺序输出，"+
+							"与原文的阅读顺序不一致",
+						s.ID, truncate(s.Title, 24)),
+					NodeIDs: []string{s.ID},
+				})
+			}
+			cursor.seen = true
+			if end := sectionEnd(s, pos, order); end > cursor.high {
+				cursor.high = end
+			}
+			visit(s.Children)
+		}
+	}
+	visit(plan.Sections)
+	return bad
+}
+
+// orderCursor tracks how far through the source the emitted plan has reached.
+type orderCursor struct {
+	order map[string]int
+	seen  bool
+	high  int
+}
+
+// sectionStart is the lowest source position the section claims: its heading
+// node when it has one, otherwise the first of its body nodes.
+func sectionStart(s *Section, order map[string]int) (int, bool) {
+	if s == nil {
+		return 0, false
+	}
+	if s.HeadingNodeID != "" {
+		if o, ok := order[s.HeadingNodeID]; ok {
+			return o, true
+		}
+	}
+	for _, id := range s.BodyNodeIDs {
+		if o, ok := order[id]; ok {
+			return o, true
+		}
+	}
+	for _, bp := range s.BodyParts {
+		if o, ok := order[bp.NodeID]; ok {
+			return o, true
+		}
+	}
+	return 0, false
+}
+
+// sectionEnd is the highest source position the section itself claims,
+// defaulting to start. Children are visited separately, so they are not
+// included here.
+func sectionEnd(s *Section, start int, order map[string]int) int {
+	end := start
+	if o, ok := order[s.HeadingNodeID]; ok && o > end {
+		end = o
+	}
+	for _, id := range s.BodyNodeIDs {
+		if o, ok := order[id]; ok && o > end {
+			end = o
+		}
+	}
+	for _, bp := range s.BodyParts {
+		if o, ok := order[bp.NodeID]; ok && o > end {
+			end = o
+		}
+	}
+	return end
+}
+
+// checkPreambleOrder reports preamble nodes that come after content the plan
+// places earlier in the document.
+//
+// The preamble is emitted under 主送机关, ahead of every chapter. A node taken
+// from the end of the source would therefore be moved to the front silently:
+// coverage is satisfied (it is claimed exactly once) and VerifyVerbatim
+// compares text by node, not by position, so the export would pass with the
+// document reordered.
+func checkPreambleOrder(rep *Report, doc *Document, plan *Plan, order map[string]int) {
+	if plan == nil || doc == nil || len(plan.PreambleNodeIDs) == 0 {
+		return
+	}
+	if len(plan.Recompose) > 0 {
+		return
+	}
+
+	var firstSection int = -1
+	var visit func([]Section)
+	visit = func(list []Section) {
+		for i := range list {
+			if p, ok := sectionStart(&list[i], order); ok {
+				if firstSection < 0 || p < firstSection {
+					firstSection = p
+				}
+			}
+			visit(list[i].Children)
+		}
+	}
+	visit(plan.Sections)
+
+	for _, id := range plan.PreambleNodeIDs {
+		o, ok := order[id]
+		if !ok {
+			continue
+		}
+		// Out of place in either direction: after the first chapter, or out
+		// of order within the preamble itself. The second case is normalised
+		// by the click-order of the review screen, so only the first is
+		// reported — otherwise every manual addition to the preamble would
+		// raise a warning.
+		if firstSection >= 0 && o > firstSection {
+			rep.Diagnostics = append(rep.Diagnostics, Diagnostic{
+				Code: "preamble_out_of_place", Severity: SevWarning,
+				Message: fmt.Sprintf(
+					"正文前言里的段落 %s 在原文中位于第一个章节之后："+
+						"成品会把它移到主送机关之下（文首），与原文的顺序不一致",
+					id),
+				NodeIDs: []string{id},
+			})
+		}
+	}
+}
+
+// titleRepeat is one synthesized section title that a body paragraph already
+// carries.
+type titleRepeat struct {
+	sectionID string
+	title     string
+	nodeID    string
+}
+
+// synthesizedTitleRepeats finds synthesized section titles that duplicate a
+// paragraph claimed as body.
+//
+// Only sections without a HeadingNodeID qualify: when the heading comes from
+// the source, VerifyPlan already requires Title to equal that node's text and
+// the node is claimed as the heading rather than as body, so the line appears
+// exactly once. The defect is specific to a model that authored the title
+// itself while leaving the source's own copy in the body.
+func synthesizedTitleRepeats(doc *Document, plan *Plan, claims map[string]int) []titleRepeat {
+	var out []titleRepeat
+	seen := make(map[string]bool)
+	var walk func([]Section)
+	walk = func(list []Section) {
+		for i := range list {
+			s := &list[i]
+			if s.HeadingNodeID == "" {
+				title := strings.TrimSpace(s.Title)
+				if title != "" {
+					if id := findNodeByExactText(doc, title); id != "" && claims[id] > 0 {
+						key := s.ID + "\x00" + id
+						if !seen[key] {
+							seen[key] = true
+							out = append(out, titleRepeat{sectionID: s.ID, title: title, nodeID: id})
+						}
+					}
+				}
+			}
+			walk(s.Children)
+		}
+	}
+	walk(plan.Sections)
+	return out
 }
 
 // hasElement reports whether a role is bound in the plan.
@@ -684,6 +1359,44 @@ func VerifyVerbatim(doc *Document, out *Doc, plan *Plan) *VerbatimDiff {
 				diff.Missing = append(diff.Missing, describeNode(n))
 				continue
 			}
+
+			// A recomposed paragraph is emitted as a sequence of declared
+			// parts. Compare it part by part rather than by concatenation:
+			// the whole point of the declaration is that the reader sees
+			// several paragraphs, and a concatenated comparison would accept
+			// the parts glued back into one.
+			if rec, ok := plan.RecomposeFor(n.ID); ok {
+				if len(e.text) != len(rec.Parts) {
+					diff.Altered = append(diff.Altered, fmt.Sprintf(
+						"%s: 重组声明为 %d 段，输出为 %d 段（未按声明重组）",
+						n.ID, len(rec.Parts), len(e.text)))
+					goto nextNode
+				}
+				mismatch := -1
+				for i := range rec.Parts {
+					if e.text[i] != rec.Parts[i] {
+						mismatch = i
+						break
+					}
+				}
+				if mismatch >= 0 {
+					diff.Altered = append(diff.Altered, fmt.Sprintf(
+						"%s: 重组第 %d 段与声明不一致：声明 %q → 输出 %q",
+						n.ID, mismatch, truncate(rec.Parts[mismatch], 60),
+						truncate(e.text[mismatch], 60)))
+					goto nextNode
+				}
+				diff.Changed = append(diff.Changed, AppliedEdit{
+					NodeID: n.ID,
+					Kind:   "recompose",
+					Label:  "重组段落",
+					Before: truncate(n.Text, 120),
+					After:  truncate(strings.Join(rec.Parts, "\n"), 120),
+					Reason: rec.Reason,
+				})
+				goto nextNode
+			}
+
 			// A node may legitimately be emitted as more than one block when
 			// the extra pieces are the node's own text split by the
 			// assembler; their concatenation is what must match.
@@ -728,6 +1441,7 @@ func VerifyVerbatim(doc *Document, out *Doc, plan *Plan) *VerbatimDiff {
 				})
 			}
 		}
+	nextNode:
 	}
 
 	// Edits targeting an unknown node never reach the loop above, so they would
@@ -823,6 +1537,19 @@ func describeNode(n Node) string {
 	default:
 		return fmt.Sprintf("%s: %s", n.ID, truncate(n.Text, 60))
 	}
+}
+
+// runeLen counts characters, not bytes, so a Chinese paragraph's size is
+// measured in the unit a reader perceives.
+func runeLen(s string) int { return len([]rune(s)) }
+
+// recomposeLen counts the characters in all declared parts.
+func recomposeLen(parts []string) int {
+	n := 0
+	for _, p := range parts {
+		n += runeLen(p)
+	}
+	return n
 }
 
 // sameTable reports whether two cell matrices are identical.

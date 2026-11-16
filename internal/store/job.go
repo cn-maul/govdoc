@@ -40,10 +40,20 @@ type StageUpdate struct {
 	Name    string `json:"name"`
 	Message string `json:"message"`
 	Done    bool   `json:"done"`
+	// Kind distinguishes an ordinary stage frame from a partial ("partial").
+	// It is not serialized: the SSE writer chooses the event name from it.
+	Kind string `json:"-"`
 	// Error is set on the terminal update when the job failed.
 	Error string `json:"error,omitempty"`
 	// Report is attached to the terminal update.
 	Report *docmodel.Report `json:"report,omitempty"`
+	// Plan and Edits carry a partial snapshot while the model is still
+	// writing. They are provisional: the arrays may be incomplete and the
+	// plan has not been verified.
+	Plan  *docmodel.Plan  `json:"plan,omitempty"`
+	Edits []docmodel.Edit `json:"edits,omitempty"`
+	// Reset clears provisional rows at the start of a new model attempt.
+	Reset bool `json:"reset,omitempty"`
 }
 
 // NewJob creates a job in the running state.
@@ -78,6 +88,18 @@ func (j *Job) Publish(u StageUpdate) {
 	if j.done {
 		j.mu.Unlock()
 		return
+	}
+	// A partial frame is a full snapshot, not a delta. Keeping every one in
+	// history would make a reload replay hundreds of ever-larger prefixes;
+	// only the newest one is useful to a late subscriber.
+	if u.Kind == "partial" {
+		kept := j.stages[:0]
+		for _, prev := range j.stages {
+			if prev.Kind != "partial" {
+				kept = append(kept, prev)
+			}
+		}
+		j.stages = kept
 	}
 	j.stages = append(j.stages, u)
 	waiters := make([]chan StageUpdate, 0, len(j.waiters))

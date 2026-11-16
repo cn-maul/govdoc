@@ -1,7 +1,7 @@
 /**
  * GovDoc 前端状态中心。
  *
- * 用一个模块级 reactive 对象承载全部跨区状态，而不是引入 Pinia：
+ * 用一个模块级 reactive 对象承载全部跨区状态，而不是引入额外状态库：
  * 三个区域共享的是同一份「当前文档 / 当前方案」，集中在一处比分散的
  * store 更容易看出「什么时候会把方案提交回服务端」。
  *
@@ -9,7 +9,7 @@
  * title / body_node_ids / heading_node_id，原文永远只从服务端读取。
  */
 
-import { computed, reactive } from 'vue'
+import { computed, reactive } from './reactive'
 import { ApiError, api, describeError, triggerDownload } from '../api/client'
 import {
   diffClean,
@@ -17,22 +17,37 @@ import {
   type ConfigResponse,
   type Direction,
   type DocumentResponse,
+  type Edit,
   type Health,
   type Plan,
+  type PartialEvent,
   type PlanResponse,
   type Profile,
   type ProfileRequest,
   type ProfilesResponse,
+  type Recompose,
   type RenderResponse,
   type Report,
   type SpecResponse,
   type StageEvent,
+  type StructureDiff,
   type UploadResponse,
 } from '../api/types'
 import { clonePlan } from '../lib/tree'
+import { addEdit, removeEditAt } from '../lib/edits'
+import {
+  applyRecompose,
+  splitRecompose,
+  type PendingRecompose,
+} from '../lib/recompose'
 
-/** 区域标识。 */
-export type TabKey = 'upload' | 'analyze' | 'review' | 'preview' | 'settings'
+/**
+ * 区域标识。
+ *
+ * `settings` 不属于左侧的 4 步工作流：它是应用级设置页，从右上角的状态按钮
+ * （以及上传区的「管理规则」）进入，整页独立，不占工作流的步骤。
+ */
+export type TabKey = 'upload' | 'settings'
 
 interface State {
   // 基础信息
@@ -65,6 +80,13 @@ interface State {
   // 方案与校验
   plan: Plan | null
   report: Report | null
+  /**
+   * 方案相对「原文自身结构」的差异。
+   *
+   * 与 report 互补：report 只说有没有丢、有没有重复；structure 说**哪几段换了
+   * 章节**。后者只能通过与原文结构比对得出，是结构层面的改动日志。
+   */
+  structure: StructureDiff | null
   /** 有未提交回服务端的本地编辑。 */
   dirty: boolean
   verifying: boolean
@@ -85,6 +107,40 @@ interface State {
   tab: TabKey
   /** 一次性中文提示（成功/失败），面向用户。 */
   notice: { kind: 'ok' | 'error' | 'info'; text: string } | null
+  /** 工作台对话（只在本会话保留）。 */
+  chat: ChatMessage[]
+  /** 对话请求进行中。 */
+  chatting: boolean
+  /** 校对项已被用户处理过的签名；处理过的项不再显示。 */
+  handledEdits: string[]
+  /** 对话新建、尚未写入方案的待审改动。 */
+  pendingEdits: Edit[]
+  /** 模型提出、尚未写入方案的整段重组。 */
+  pendingRecompose: PendingRecompose[]
+  /** 最近一次处理的校对项：同意后短暂显示，让用户看到确实覆盖了原文。 */
+  lastHandled: AppliedEdit | null
+  /** 最近一次处理的重组。 */
+  lastHandledRecompose: AppliedRecompose | null
+  /** 模型仍在生成时的临时方案；只用于先显示，不参与预览/导出。 */
+  partialPlan: Plan | null
+  /** 模型仍在生成时的临时校对项；终态到达后由正式列表整体替换。 */
+  partialEdits: Edit[]
+  /** 模型仍在生成时的临时重组声明。 */
+  partialRecompose: Recompose[]
+}
+
+/** 对话里的一条消息。 */
+export interface ChatMessage {
+  id: string
+  role: 'user' | 'assistant'
+  text: string
+}
+
+/** 刚刚处理的一条校对项，供校对栏显示「已覆盖/已保留」。 */
+export interface AppliedEdit {
+  edit: Edit
+  accepted: boolean
+  at: number
 }
 
 const state = reactive<State>({
@@ -111,6 +167,7 @@ const state = reactive<State>({
 
   plan: null,
   report: null,
+  structure: null,
   dirty: false,
   verifying: false,
 
@@ -120,6 +177,16 @@ const state = reactive<State>({
 
   tab: 'upload',
   notice: null,
+  chat: [],
+  chatting: false,
+  handledEdits: [],
+  pendingEdits: [],
+  pendingRecompose: [],
+  lastHandled: null,
+  lastHandledRecompose: null,
+  partialPlan: null,
+  partialEdits: [],
+  partialRecompose: [],
 })
 
 /**
@@ -150,6 +217,18 @@ export function notify(kind: 'ok' | 'error' | 'info', text: string): void {
 
 export function dismissNotice(): void {
   state.notice = null
+}
+
+/**
+ * 切换到某个区域。
+ *
+ * 组件不直接写 `gov.tab`：切换区域会顺带滚动到页首（否则从校对区滚到一半点
+ * 「设置」，设置页一打开就停在中间），这个副作用应该只在一处发生。
+ */
+export function showTab(key: TabKey): void {
+  if (state.tab === key) return
+  state.tab = key
+  window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
 /** 把异常变成中文提示并返回文本。 */
@@ -215,26 +294,32 @@ export async function refreshConfig(): Promise<void> {
   }
 }
 
-/** 保存 LLM 配置与行文方向。api_key 只在用户实际输入时才提交。 */
+/**
+ * 保存配置的任意子集。省略的字段保持不变。
+ *
+ * 模型连接与行文方向在不同页签里编辑，各保存各的；如果这里总是回传全部字段，
+ * 在模型页点保存就会把「其他设置」里尚未保存的临时选择一并写掉。
+ */
 export async function saveConfig(input: {
-  endpoint: string
-  model: string
-  protocol: string
-  apiKey: string
-  direction: Direction
-  allowEdits: boolean
+  endpoint?: string
+  model?: string
+  protocol?: string
+  apiKey?: string
+  direction?: Direction
+  allowEdits?: boolean
 }): Promise<boolean> {
   state.savingConfig = true
   try {
-    const req: Parameters<typeof api.putConfig>[0] = {
-      endpoint: input.endpoint,
-      model: input.model,
-      protocol: input.protocol,
-      direction: input.direction,
-      allow_edits: input.allowEdits,
-    }
+    const req: Parameters<typeof api.putConfig>[0] = {}
+    if (input.endpoint !== undefined) req.endpoint = input.endpoint
+    if (input.model !== undefined) req.model = input.model
+    if (input.protocol !== undefined) req.protocol = input.protocol
+    if (input.direction !== undefined) req.direction = input.direction
+    if (input.allowEdits !== undefined) req.allow_edits = input.allowEdits
     // 只有用户真的敲了新密钥才提交，否则服务端保留原密钥。
-    if (input.apiKey.trim() !== '') req.api_key = input.apiKey.trim()
+    if (input.apiKey !== undefined && input.apiKey.trim() !== '') {
+      req.api_key = input.apiKey.trim()
+    }
 
     const saved = await api.putConfig(req)
     state.config = saved
@@ -252,14 +337,9 @@ export async function saveConfig(input: {
     if (saved.save_warning) {
       notify('error', saved.save_warning)
     } else if (saved.saved_to_disk && saved.persistent) {
-      notify(
-        'ok',
-        saved.settings_path
-          ? `已保存，重启后仍然有效（配置文件：${saved.settings_path}）`
-          : '已保存，重启后仍然有效。',
-      )
+      notify('ok', '已保存。')
     } else {
-      notify('info', '已保存，本次运行内有效；当前安装未启用配置持久化，重启后需要重新填写。')
+      notify('info', '已保存，本次运行内有效。')
     }
     return true
   } catch (err) {
@@ -387,6 +467,13 @@ export async function uploadDocument(file: File, profileId?: string): Promise<bo
     state.jobId = ''
     state.dirty = false
     state.source = null
+    state.chat = []
+    state.handledEdits = []
+    state.pendingEdits = []
+    state.pendingRecompose = []
+    state.chatting = false
+    state.partialPlan = null
+    state.partialEdits = []
 
     // 用户选的那套可能不存在（比如刚被别人删了），服务端会静默回退。
     // 界面必须按实际生效的那套说话，否则用户会以为用了一套没用的规则。
@@ -414,12 +501,179 @@ export async function uploadDocument(file: File, profileId?: string): Promise<bo
   }
 }
 
+// ---------------------------------------------------------------- 工作台对话
+
+let chatSeq = 0
+
+/** 往对话里追加一条消息。 */
+function pushChat(role: 'user' | 'assistant', text: string): void {
+  chatSeq++
+  state.chat = [...state.chat, { id: `m${chatSeq}`, role, text }]
+}
+
+/**
+ * 把一句修改要求交给模型，并把返回的改动放进待审列表。
+ *
+ * 不直接改方案：返回的 edits 只是「模型的建议」，用户在校对栏逐条处理。
+ * 这与服务端的契约一致 —— POST /revise 从不写方案，只有 PUT /plan 才会。
+ */
+export async function requestRevision(
+  instruction: string,
+  selection?: { text: string; nodeId?: string },
+): Promise<void> {
+  const docId = currentDocId()
+  if (docId === '') {
+    notify('error', '尚未上传文档。')
+    return
+  }
+  const text = instruction.trim()
+  if (text === '') return
+
+  pushChat('user', text)
+  state.chatting = true
+  try {
+    const res = await api.revise(docId, {
+      instruction: text,
+      selection: selection?.text,
+      node_id: selection?.nodeId,
+      // 这是用户主动提出的修改要求，必须允许模型给出改动；
+      // 保存的「允许修正」偏好只约束自动分析。
+      allow_edits: true,
+    })
+    const edits = res.edits ?? []
+    if (edits.length === 0) {
+      pushChat('assistant', res.reply?.trim() || '没有需要修改的地方。')
+      return
+    }
+    state.pendingEdits = [...state.pendingEdits, ...edits]
+    pushChat('assistant', res.reply?.trim() || `已生成 ${edits.length} 条待校对改动。`)
+  } catch (err) {
+    const msg = describeError(err)
+    pushChat('assistant', msg)
+    notify('error', msg)
+  } finally {
+    state.chatting = false
+  }
+}
+
+/**
+ * 重新分析当前文档。
+ *
+ * 自动分析沿用「其他设置」里的偏好；未保存过偏好时默认允许提出修订，
+ * 否则校对栏永远是空的，用户会以为功能坏了。
+ */
+export async function reanalyze(): Promise<void> {
+  const docId = currentDocId()
+  if (docId === '') return
+  await startAnalysis(docId, '', undefined, state.config?.allow_edits ?? true)
+}
+
+/** 移除一条待审改动（拒绝后不再显示）。 */
+export function dismissPendingEdit(index: number): void {
+  const edit = state.pendingEdits[index]
+  state.pendingEdits = state.pendingEdits.filter((_, i) => i !== index)
+  if (edit) state.lastHandled = { edit, accepted: false, at: Date.now() }
+}
+
+/**
+ * 接受一条待审改动：写入方案并重新校验。
+ *
+ * 处理完的卡片从待审列表消失，同时留下一句结果提示。否则用户点「同意」只会
+ * 看到卡片凭空不见，无法判断原文是否真的改了 —— 而「同意就覆盖」正是这块
+ * 界面唯一的承诺。
+ */
+export async function acceptPendingEdit(index: number): Promise<boolean> {
+  const edit = state.pendingEdits[index]
+  if (!edit) return false
+  editPlan((plan) => addEdit(plan, edit))
+  // 已接受的项进入方案，不能再次以「待处理」或「原文修改」出现：
+  // 校对栏只保留尚未处理的改动。
+  markHandledEdit(edit)
+  state.pendingEdits = state.pendingEdits.filter((_, i) => i !== index)
+  const ok = await verifyPlanNow()
+  state.lastHandled = { edit, accepted: true, at: Date.now() }
+  return ok
+}
+
+/** 接受方案内的一条已声明改动：只做一次显式校验。 */
+export async function acceptDeclaredEdit(edit: Edit): Promise<boolean> {
+  markHandledEdit(edit)
+  const ok = await verifyPlanNow()
+  state.lastHandled = { edit, accepted: true, at: Date.now() }
+  return ok
+}
+
+/**
+ * 接受一条重组：把模型改写的段落与分片落点一起写回方案。
+ *
+ * 只写 recompose 不写 body_parts 会漏掉正文；只写 body_parts 不写
+ * recompose 会被判为未声明分片。两者必须同时写回，所以走 applyRecompose。
+ */
+export async function acceptRecompose(index: number): Promise<boolean> {
+  const pending = state.pendingRecompose[index]
+  if (!pending) return false
+  editPlan((plan) => applyRecompose(plan, pending))
+  state.pendingRecompose = state.pendingRecompose.filter((_, i) => i !== index)
+  const ok = await verifyPlanNow()
+  state.lastHandledRecompose = { rec: pending.recompose, accepted: true, at: Date.now() }
+  return ok
+}
+
+/** 拒绝一条重组：不写回方案，骨架方案继续显示原文。 */
+export function rejectRecompose(index: number): void {
+  const pending = state.pendingRecompose[index]
+  state.pendingRecompose = state.pendingRecompose.filter((_, i) => i !== index)
+  if (pending) {
+    state.lastHandledRecompose = { rec: pending.recompose, accepted: false, at: Date.now() }
+  }
+}
+
+/** 刚刚处理的一条重组，供校对栏显示结果。 */
+export interface AppliedRecompose {
+  rec: Recompose
+  accepted: boolean
+  at: number
+}
+
+/** 拒绝方案内的一条已声明改动：撤回声明并重新校验。 */
+export async function rejectDeclaredEdit(edit: Edit): Promise<boolean> {
+  if (!state.plan) return false
+  const key = editSignature(edit)
+  const index = (state.plan.edits ?? []).findIndex((e) => editSignature(e) === key)
+  if (index < 0) return false
+  editPlan((plan) => removeEditAt(plan, index))
+  markHandledEdit(edit)
+  const ok = await verifyPlanNow()
+  state.lastHandled = { edit, accepted: false, at: Date.now() }
+  return ok
+}
+
+/** 记住某条改动已处理，校对栏只显示未处理的。 */
+export function markHandledEdit(edit: Edit): void {
+  const key = editSignature(edit)
+  if (!state.handledEdits.includes(key)) {
+    state.handledEdits = [...state.handledEdits, key]
+  }
+}
+
+/** 改动签名（与 lib/edits.ts 的 editKey 对齐）。 */
+export function editSignature(edit: Edit): string {
+  return [edit.node_id ?? '', edit.kind, edit.before, edit.occurrence ?? 0].join('\u0000')
+}
+
 /** 读取完整源文档（校对区需要逐字原文）。 */
 export async function loadSource(docId: string): Promise<void> {
   if (state.source?.doc_id === docId) return
   try {
     state.source = await api.getDocument(docId)
   } catch (err) {
+    // 服务重启后内存里的文档已不存在。继续留在工作台只会让预览、校对、导出
+    // 全部报 404，用户又找不到「重新上传」的入口；直接回到上传页并说明原因。
+    if (err instanceof ApiError && err.code === 'not_found') {
+      resetDocument()
+      notify('info', '这份文档已不在服务端（服务可能重启过），请重新上传。')
+      return
+    }
     fail('读取原文失败', err)
   }
 }
@@ -450,20 +704,30 @@ export async function startAnalysis(
   hint: string,
   direction?: Direction,
   allowEdits?: boolean,
+  baselineOnly = false,
 ): Promise<void> {
   closeEvents()
   state.analyzing = true
   state.analysisError = ''
   state.stages = []
+  state.partialPlan = null
+  state.partialEdits = []
+  state.partialRecompose = []
   state.render = null
   state.downloaded = []
 
   try {
-    const req: { hint?: string; direction?: Direction; allow_edits?: boolean } = {}
+    const req: {
+      hint?: string
+      direction?: Direction
+      allow_edits?: boolean
+      baseline?: boolean
+    } = {}
     if (hint.trim() !== '') req.hint = hint.trim()
     if (direction) req.direction = direction
     // 省略表示沿用服务端保存的偏好；显式传值才覆盖它。
     if (allowEdits !== undefined) req.allow_edits = allowEdits
+    if (baselineOnly) req.baseline = true
     const { job_id } = await api.startPlan(docId, req)
     state.jobId = job_id
   } catch (err) {
@@ -475,10 +739,18 @@ export async function startAnalysis(
   await new Promise<void>((resolve) => {
     const es = new EventSource(api.eventsURL(state.jobId))
     events = es
+    // 一旦收到终态帧，这次分析就已经有结论了。EventSource 在服务端关闭
+    // 流之后还会补发一个 error 事件；若不拦住它，兜底拉取会再取一次方案并把
+    // 刚写入的失败原因覆盖掉 —— 用户看到的就变成「什么都没发生」。
+    let settled = false
 
     const finish = (): void => {
+      settled = true
       closeEvents()
       state.analyzing = false
+      state.partialPlan = null
+      state.partialEdits = []
+      state.partialRecompose = []
       resolve()
     }
 
@@ -491,13 +763,49 @@ export async function startAnalysis(
       else state.stages.push(frame)
     })
 
+    // 模型边生成边推回已完成的对象。这里只更新“预览用的临时视图”，
+    // 不把它写进 plan，也不触发校验：半成品可能缺段落、缺章节，不能当成
+    // 可导出的方案。
+    es.addEventListener('partial', (ev) => {
+      const frame = parseFrame<PartialEvent>(ev)
+      if (!frame) return
+      if (frame.reset) {
+        state.partialPlan = null
+        state.partialEdits = []
+        state.partialRecompose = []
+        return
+      }
+      if (frame.plan) state.partialPlan = normalizePlan(frame.plan)
+      if (frame.edits) state.partialEdits = frame.edits
+      if (frame.plan?.recompose) state.partialRecompose = frame.plan.recompose
+    })
+
     es.addEventListener('done', (ev) => {
-      const frame = parseFrame<{ plan: Plan | null; report: Report | null; error?: string }>(ev)
-      if (frame) applyPlanResult(frame.plan, frame.report, frame.error)
-      finish()
+      const frame = parseFrame<{
+        plan: Plan | null
+        report: Report | null
+        structure?: StructureDiff
+        error?: string
+      }>(ev)
+      if (!frame) {
+        finish()
+        return
+      }
+      settled = true
+      const staged = applyPlanResult(frame.plan, frame.report, frame.error, frame.structure)
+      if (!staged || !frame.plan) {
+        closeEvents()
+        state.analyzing = false
+        resolve()
+        return
+      }
+      // 服务端存的是「带改动」的方案，预览会直接画出改后的文字。先把去掉
+      // 改动的方案写回，左栏才与待审列表一致；接受某条时再单独写回。
+      void submitPlan(docId, false).finally(finish)
     })
 
     es.addEventListener('error', (ev) => {
+      if (settled) return
       // 服务端主动发的 error 帧带 data；EventSource 自身断线时 data 为空。
       const frame = parseFrame<{ code?: string; message?: string }>(ev as MessageEvent)
       if (frame?.message) {
@@ -506,14 +814,22 @@ export async function startAnalysis(
         finish()
         return
       }
-      if (es.readyState === EventSource.CLOSED || state.analyzing) {
-        // 连接断了：拉一次最终结果，可能服务端已经算完。
+      if (es.readyState === EventSource.CLOSED) {
+        // 连接已经彻底关闭：拉一次最终结果，可能服务端已经算完。
+        //
+        // CONNECTING 时必须等浏览器自动重连：分析还在跑的时候，一次短暂的
+        // 网络抖动会先触发 error，此时 GET /plan 会得到 404「尚未生成结构方案」，
+        // 用户就会看到一条并不真实的失败提示。
         void fallbackFetchPlan(docId).finally(finish)
       }
     })
 
     es.addEventListener('open', () => {
-      state.analysisError = ''
+      // 只清除「连接失败」类的旧提示；模型给出的实质错误在 open 时还不知道，
+      // 这里清掉会让用户看不到上一轮为什么失败。
+      if (!settled && state.analysisError.startsWith('无法开始分析')) {
+        state.analysisError = ''
+      }
     })
   })
 }
@@ -534,12 +850,18 @@ async function fallbackFetchPlan(docId: string): Promise<void> {
   try {
     const res = await api.getPlan(docId)
     if (res.plan) {
-      applyPlanResult(res.plan, res.report)
+      const staged = applyPlanResult(res.plan, res.report, undefined, res.structure)
+      if (staged) await submitPlan(docId, false)
       return
     }
     state.analysisError = '分析连接中断，且服务端尚未产出方案，请重新分析。'
     notify('error', state.analysisError)
   } catch (err) {
+    if (err instanceof ApiError && err.code === 'not_found') {
+      state.analysisError = '分析连接中断，服务端没有可用的结构方案，请重新分析。'
+      notify('error', state.analysisError)
+      return
+    }
     fail('分析连接中断后拉取结果失败', err)
     state.analysisError = describeError(err)
   }
@@ -556,17 +878,35 @@ export function applyPlanResult(
   plan: Plan | null,
   report: Report | null,
   error?: string,
-): void {
+  structure?: StructureDiff | null,
+): boolean {
   if (!plan) {
     state.analysisError = error
       ? `分析失败：${error}`
       : '模型没有返回结构方案，请重试或检查模型配置。'
     notify('error', state.analysisError)
-    return
+    return false
   }
 
-  state.plan = normalizePlan(plan)
+  const normalized = normalizePlan(plan)
+  // 模型给出的改动是**建议**，不是用户已经接受的结果。先移出方案、放进
+  // 待审列表：预览必须保持原文，直到用户逐条同意。
+  const incoming = normalized.edits ?? []
+  const split = splitRecompose({
+    ...normalized,
+    edits: [],
+  })
+  state.plan = split.plan
   state.report = normalizeReport(report)
+  state.structure = structure ?? null
+  state.handledEdits = []
+  state.pendingEdits = incoming
+  state.pendingRecompose = split.pending
+  state.lastHandled = null
+  state.lastHandledRecompose = null
+  state.partialPlan = null
+  state.partialEdits = []
+  state.partialRecompose = []
   state.dirty = false
   editRevision++
   cancelScheduledVerify()
@@ -578,10 +918,11 @@ export function applyPlanResult(
       'error',
       '模型未能一次生成通过校验的方案，已保留它给出的部分方案。请在校对区修复漏收/重复后导出。',
     )
-    return
+    return incoming.length > 0 || split.pending.length > 0
   }
 
   state.analysisError = ''
+  return incoming.length > 0 || split.pending.length > 0
 }
 
 /**
@@ -601,21 +942,34 @@ function normalizeReport(report: Report | null | undefined): Report | null {
 
 /** 服务端可能省略空数组，前端一律补齐，减少到处写 ?? [] 。 */
 function normalizePlan(plan: Plan): Plan {
-  const fix = (s: Plan['sections'][number]): Plan['sections'][number] => ({
+  const fix = (
+    s: Plan['sections'][number],
+    path: string,
+  ): Plan['sections'][number] => ({
     ...s,
+    // 流式快照的章节（尤其是子章节）可能还没有 id。React 列表若用
+    // undefined 作 key，会把这些行合并成一行。只在缺失时补一个稳定占位，
+    // 终态方案到达后会被真实 id 覆盖。
+    id: s.id || `__p${path}`,
     body_node_ids: s.body_node_ids ?? [],
-    children: (s.children ?? []).map(fix),
+    body_parts: (s.body_parts ?? []).map((bp) => ({ ...bp })),
+    children: (s.children ?? []).map((child, i) => fix(child, `${path}-${i}`)),
   })
   return {
     ...plan,
     meta: plan.meta ?? {},
     // elements 必须保留：它是「这个节点就是标题/成文日期/抄送」的声明。
     elements: (plan.elements ?? []).map((e) => ({ ...e })),
-    sections: (plan.sections ?? []).map(fix),
+    sections: (plan.sections ?? []).map((s, i) => fix(s, String(i))),
     // edits 必须保留：它是「原文这里被改过」的声明。丢掉它，那段文字在成文时
     // 就失去授权，VerifyVerbatim 会把同一处判成「未声明的改写」而拒绝导出 ——
     // 用户明明什么都没做，却突然导不出来了。
     edits: (plan.edits ?? []).map((e) => ({ ...e })),
+    recompose: (plan.recompose ?? []).map((r) => ({
+      ...r,
+      parts: [...r.parts],
+      roles: r.roles ? [...r.roles] : undefined,
+    })),
     notes: plan.notes ?? [],
   }
 }
@@ -695,10 +1049,14 @@ export async function submitPlan(docId: string, explicit = true): Promise<boolea
     // 编辑已继续：这次回包只用于显示，不得覆盖用户的新输入。
     if (editRevision !== revAtStart) {
       state.report = normalizeReport(res.report)
+      state.structure = res.structure ?? null
       return reportOK(res.report)
     }
     if (res.plan) state.plan = normalizePlan(res.plan)
     state.report = normalizeReport(res.report)
+    // 服务端每次校验都会重算结构差异（基线由原文推导，不依赖模型），所以
+    // 这里必须收下——否则用户改完结构后界面上还显示旧的移动清单。
+    state.structure = res.structure ?? null
     state.dirty = false
     lastAutoError = ''
     const ok = reportOK(res.report)
@@ -735,9 +1093,46 @@ export function replacePlan(plan: Plan, report: Report | null): void {
   cancelScheduledVerify()
   state.plan = normalizePlan(plan)
   state.report = normalizeReport(report)
+  state.handledEdits = []
+  state.pendingEdits = []
+  state.pendingRecompose = []
+  state.partialPlan = null
+  state.partialEdits = []
+  state.partialRecompose = []
+  // 手工替换的方案与原文结构的差异未知，等服务端下次校验回包再填。
+  state.structure = null
   state.dirty = false
   state.render = null
   editRevision++
+}
+
+/** 清空当前文档，回到首屏上传区。 */
+export function resetDocument(): void {
+  closeEvents()
+  cancelScheduledVerify()
+  state.upload = null
+  state.source = null
+  state.plan = null
+  state.report = null
+  state.structure = null
+  state.lastHandled = null
+  state.lastHandledRecompose = null
+  state.render = null
+  state.downloaded = []
+  state.stages = []
+  state.jobId = ''
+  state.analyzing = false
+  state.analysisError = ''
+  state.dirty = false
+  state.chat = []
+  state.chatting = false
+  state.handledEdits = []
+  state.pendingEdits = []
+  state.pendingRecompose = []
+  state.partialPlan = null
+  state.partialEdits = []
+  state.partialRecompose = []
+  showTab('upload')
 }
 
 // ---------------------------------------------------------------- 导出

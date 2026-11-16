@@ -48,8 +48,10 @@ type Config struct {
 	// Nil disables persistence, which is what the tests want and what a
 	// read-only install gets.
 	Settings *config.Store
-	// AllowEdits is the persisted default for permitting content corrections.
-	AllowEdits bool
+	// AllowEdits overrides the default of permitting content corrections.
+	// nil keeps the default (on); tests and embedders use it to start in the
+	// strict mode.
+	AllowEdits *bool
 	Logger     *slog.Logger
 }
 
@@ -82,6 +84,9 @@ type Server struct {
 	spec     gbstandard.Spec
 	analyzer Analyzer
 	// allowEdits is whether the user permits the model to correct content.
+	// It defaults to true: the 校对 pane is the workbench's main output, and a
+	// default of false silently produced an empty review list on every fresh
+	// install — indistinguishable from the feature being broken.
 	allowEdits bool
 	// profiles are the available formatting rule sets and activeProfile is the
 	// one applied to new uploads. They live under the same mutex as spec because
@@ -102,6 +107,17 @@ type Progress struct {
 	Done    bool   `json:"done"`
 }
 
+// PartialProgress is one provisional plan snapshot during a model call.
+//
+// Reset asks the client to discard the previous attempt's provisional rows.
+// A snapshot is never treated as a verdict; only the Analyzer's final return
+// value goes through VerifyPlan and becomes renderable.
+type PartialProgress struct {
+	Plan  *docmodel.Plan
+	Edits []docmodel.Edit
+	Reset bool
+}
+
 // Analyzer produces a structural plan for a document.
 //
 // It is an interface for two reasons: internal/server then has no dependency
@@ -120,7 +136,54 @@ type Progress struct {
 // program that decides whether a plan is renderable — an analyzer cannot
 // bypass it by reporting success.
 type Analyzer interface {
-	Analyze(ctx context.Context, doc *docmodel.Document, opts AnalysisOptions, progress func(Progress)) (*docmodel.Plan, error)
+	Analyze(
+		ctx context.Context,
+		doc *docmodel.Document,
+		opts AnalysisOptions,
+		progress func(Progress),
+		partial func(PartialProgress),
+	) (*docmodel.Plan, error)
+}
+
+// Reviser proposes declared content edits in response to a user request.
+//
+// It is deliberately separate from Analyzer, and deliberately returns edits
+// rather than a rewritten document. The chat panel lets the user ask for any
+// change ("把这句话改短一点"), and the answer must remain something the user
+// can accept or reject one item at a time. Returning a plan, or rewritten
+// text, would either re-run the whole restructuring or let prose bypass the
+// before/after review the rest of the program is built around.
+//
+// Every edit it returns is still verified server-side: Before must occur in
+// the named node, so a model cannot invent a target.
+type Reviser interface {
+	Revise(ctx context.Context, doc *docmodel.Document, req RevisionRequest) (RevisionResult, error)
+}
+
+// RevisionResult is one chat turn's answer.
+type RevisionResult struct {
+	// Edits are the proposed changes. None of them is applied here: the user
+	// accepts or rejects each one in the review list.
+	Edits []docmodel.Edit
+	// Reply is a short explanation shown in the chat, including when the model
+	// declines to change anything.
+	Reply string
+}
+
+// RevisionRequest carries one chat turn.
+type RevisionRequest struct {
+	// Instruction is what the user wants changed, in their own words.
+	Instruction string
+	// Selection is the text the user highlighted for the request. Empty means
+	// the instruction applies to the document as a whole.
+	Selection string
+	// NodeID names the node the selection came from, when known. It scopes the
+	// model's answer and lets the server check Before against that node.
+	NodeID string
+	// AllowEdits permits the model to propose content changes at all. The chat
+	// panel is useless when it is false, but the override still exists so a
+	// saved "no corrections" preference is not silently ignored.
+	AllowEdits bool
 }
 
 // Reconfigurable is implemented by an analyzer that can adopt a changed model
@@ -128,6 +191,12 @@ type Analyzer interface {
 // otherwise the settings save looks like it silently failed.
 type Reconfigurable interface {
 	Reconfigure(LLMConfig) error
+}
+
+// ModelLister lists the models available at a connection that may not be saved
+// yet. The settings UI uses it to turn the model-name field into a picker.
+type ModelLister interface {
+	ListModels(ctx context.Context, cfg LLMConfig) ([]string, error)
 }
 
 // New builds a server.
@@ -150,7 +219,10 @@ func New(cfg Config) *Server {
 		log:            cfg.Logger,
 		llm:            cfg.LLM,
 		spec:           cfg.Spec,
-		allowEdits:     cfg.AllowEdits,
+		// Corrections are proposed by default. The user still screens every
+		// edit before it reaches the document, so this widens what may be
+		// *offered*, never what may happen silently.
+		allowEdits:     cfg.AllowEdits == nil || *cfg.AllowEdits,
 		specOverridden: specOverridden,
 		// Seed the in-memory profile list even without a settings file, so the
 		// profile endpoints work on a first run with -no-save.
@@ -212,7 +284,12 @@ func (s *Server) loadSettings() {
 			s.spec.Direction = d
 		}
 	}
-	s.allowEdits = f.AllowEdits
+	// A file written before the field became a pointer has no allow_edits key,
+	// which means "never chosen" — keep the default (on). Only an explicit
+	// false in the file turns corrections off.
+	if f.AllowEdits != nil {
+		s.allowEdits = *f.AllowEdits
+	}
 
 	// Profiles replace the single spec as the unit of formatting. The spec the
 	// server was constructed with becomes the 公文 profile's rules when no
@@ -308,7 +385,7 @@ func (s *Server) persistSettings() error {
 		f.Protocol = s.llm.Protocol
 		f.APIKey = s.llm.APIKey
 		f.Direction = string(s.spec.Direction)
-		f.AllowEdits = s.allowEdits
+		f.AllowEdits = &s.allowEdits
 	})
 }
 
@@ -416,6 +493,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	mux.HandleFunc("PUT /api/config", s.handlePutConfig)
+	mux.HandleFunc("POST /api/llm/models", s.handleListModels)
 	mux.HandleFunc("GET /api/spec", s.handleSpec)
 
 	// Formatting profiles. Registration order matters here: the literal
@@ -433,6 +511,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/documents/{id}/plan", s.handleStartPlan)
 	mux.HandleFunc("GET /api/documents/{id}/plan", s.handleGetPlan)
 	mux.HandleFunc("PUT /api/documents/{id}/plan", s.handlePutPlan)
+	mux.HandleFunc("POST /api/documents/{id}/revise", s.handleRevise)
 	mux.HandleFunc("POST /api/documents/{id}/render", s.handleRender)
 	mux.HandleFunc("GET /api/documents/{id}/preview", s.handlePreview)
 

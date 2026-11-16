@@ -32,7 +32,7 @@ func TestSaveThenLoadRoundTrips(t *testing.T) {
 		Protocol:   "openai-chat",
 		APIKey:     "sk-secret",
 		Direction:  "上行文",
-		AllowEdits: true,
+		AllowEdits: boolPtr(true),
 	}
 	if err := s.Save(want); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -57,7 +57,7 @@ func TestSaveThenLoadRoundTrips(t *testing.T) {
 	if got.Direction != want.Direction {
 		t.Errorf("Direction = %q, 期望 %q", got.Direction, want.Direction)
 	}
-	if !got.AllowEdits {
+	if got.AllowEdits == nil || !*got.AllowEdits {
 		t.Error("AllowEdits 未保留")
 	}
 	if got.Version != currentVersion {
@@ -602,6 +602,8 @@ func TestNewUsesDefaultPathWhenEmpty(t *testing.T) {
 
 // TestConcurrentSaveAndLoad: the HTTP handlers write settings from parallel
 // goroutines while reads happen, so the lock discipline matters.
+func boolPtr(v bool) *bool { return &v }
+
 func TestConcurrentSaveAndLoad(t *testing.T) {
 	s := newTestStore(t)
 	const workers = 8

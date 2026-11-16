@@ -168,6 +168,17 @@ func plainParagraphs(lines []line) []paragraph {
 		curKind, curLevel, curStyle = docmodel.KindParagraph, 0, ""
 	}
 
+	// A plain-text 公文 often puts its 标题 on the first line and the recipient
+	// and body immediately below it, with no blank line between them. Treating
+	// those lines as one paragraph makes the title impossible to bind as a
+	// 公文要素: the model would have to rewrite the title as part of the body.
+	// Splitting the opening title is safe because it only moves a line
+	// boundary; every character of that line is still one node's text.
+	if titleAt := openingTitleLine(lines); titleAt >= 0 {
+		out = append(out, paragraph{text: lines[titleAt].text, kind: docmodel.KindParagraph})
+		lines = append(append([]line(nil), lines[:titleAt]...), lines[titleAt+1:]...)
+	}
+
 	for _, l := range lines {
 		if l.text == "" {
 			flush()
@@ -192,6 +203,58 @@ func plainParagraphs(lines []line) []paragraph {
 	}
 	flush()
 	return out
+}
+
+// openingTitleLine returns the index of a first non-empty line that reads like
+// a 公文 title, or -1.
+//
+// The evidence has to be strong enough not to split ordinary prose. The line
+// must be short, carry no sentence-ending punctuation or 层次序数, and be
+// followed by a longer line that looks like a recipient or body. Those are
+// exactly the files where the first line is an unmarked title rather than the
+// opening sentence of one paragraph.
+func openingTitleLine(lines []line) int {
+	first := -1
+	for i, l := range lines {
+		if strings.TrimSpace(l.text) != "" {
+			first = i
+			break
+		}
+	}
+	if first < 0 {
+		return -1
+	}
+	t := strings.TrimSpace(lines[first].text)
+	if t == "" || len([]rune(t)) > 60 || NumberingLevel(t) > 0 {
+		return -1
+	}
+	if strings.ContainsAny(t, "。；;！？!?") {
+		return -1
+	}
+
+	next := ""
+	for i := first + 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i].text) != "" {
+			next = strings.TrimSpace(lines[i].text)
+			break
+		}
+	}
+	if next == "" {
+		return -1
+	}
+	// A recipient line ("各中小学、幼儿园：") is the conventional marker that
+	// the preceding line is the title. Otherwise require the next line to be
+	// substantially longer, which distinguishes a heading-like opening from a
+	// wrapped sentence.
+	if strings.Contains(next, "：") || strings.Contains(next, ":") {
+		if len([]rune(next)) <= 40 || strings.HasPrefix(next, "各") {
+			return first
+		}
+	}
+	if len([]rune(next)) >= len([]rune(t))*3 {
+		return first
+	}
+	return -1
 }
 
 // ---------------------------------------------------------------- markdown
@@ -478,6 +541,24 @@ var (
 	reNumParen = regexp.MustCompile(`^[（(][0-9]{1,3}[）)]`)
 	reBullet   = regexp.MustCompile(`^[•·▪‣◦]\s*`)
 )
+
+// NumberingLevel reports the 层次序数 depth implied by text's own leading
+// number, or 0 when it has none.
+//
+// It is exported because the parser is not the only consumer of that
+// knowledge. A .docx whose chapter headings were typed as ordinary
+// paragraphs — no Heading style, no outline level — parses as 正文, and the
+// model then has no way to tell "一、总体要求" from a sentence that happens to
+// start with 一、. The planning prompt uses this to point those lines out, so
+// the signal comes from the same patterns that classify .txt and .md rather
+// than a second, subtly different copy.
+func NumberingLevel(text string) int {
+	kind, level, _, isHeading := classifyTextLine(text)
+	if !isHeading || kind != docmodel.KindHeading {
+		return 0
+	}
+	return level
+}
 
 // classifyTextLine inspects a plain-text line for the source's own structural
 // markers and returns the node classification. isHeading is false when the
